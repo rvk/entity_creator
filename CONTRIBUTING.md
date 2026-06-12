@@ -5,7 +5,12 @@ keep changes focused and readable.
 
 ## Project layout
 
-- `update_knx_config.py` — the entire CLI. All logic lives here.
+- `update_knx_config.py` — interactive CLI for single-entity create/delete.
+  Contains the WebSocket layer and per-platform config builders.
+- `parse_knx_project.py` — batch parser for ETS `.knxproj` files.
+  Uses `xknxproject` to extract entities and delegates creation to
+  `update_knx_config`.
+- `requirements.txt` — Python dependencies.
 - `README.md` — user-facing documentation.
 - `LICENSE` — MIT.
 
@@ -152,6 +157,44 @@ One per platform, returning the `{"entity": …, "knx": …}` payload:
 4. Verify field names against `knx/get_schema` on a live HA instance — the
    schema is the source of truth and has changed across KNX integration
    releases.
+
+## KNX project parser architecture
+
+`parse_knx_project.py` follows a strict data-driven design:
+
+### Classification chain
+
+1. **`_classify_com_object(co)`** — inspects a single communication object:
+   DPT numbers, flag patterns (`[W--]`, `[-TR]`, `[WTR]`, `[W-R]`).
+2. **`_classify_device(dev, com_objects)`** — aggregates all communication
+   objects on a device to determine its role:
+   - `is_pure_actuator` — has DPT 1 `[W--]` (accepts bus commands)
+   - `is_lighting_gateway` — has DPT 5 (brightness) or DPT 3 (dimming)
+   - `is_sensor_input` — originates DPT 1 sensor readings, no write-only
+   - `is_thermostat_controller` — has DPT 9 AND write-capable DPT 1
+3. **`_classify_ga(ga, com_objects, devices)`** — aggregates device roles
+   across all devices linked to a group address.
+
+### Entity builders
+
+Each builder (`_build_light`, `_build_switch`, `_build_climate`,
+`_build_cover`) receives a group of related GAs (from a KNX function) and
+uses only DPT + flags + device roles to determine which GA is the switch
+write, switch state, brightness, setpoint, etc.
+
+No manufacturer-specific com-object names are used. No
+language-dependent hardware names are matched. The classifiers work
+across different manufacturers (ABB, MDT, Gira, Siemens, Zennio) and ETS
+language versions without modification.
+
+### Entity extraction
+
+1. **Functions first.** The KNX project's own function definitions
+   (FT-1/6/8/10) are the primary source — they tell us which GAs belong
+   together and what entity type they represent.
+2. **Unmapped fallback.** GAs not in any function are analyzed via
+   `_classify_ga`: relay pairs are grouped as switches, binary inputs
+   become binary sensors.
 
 ## Reporting issues
 

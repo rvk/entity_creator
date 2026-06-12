@@ -91,6 +91,94 @@ python3 update_knx_config.py \
 python3 update_knx_config.py --delete "light.living_room_light"
 ```
 
+## Project Parser — `parse_knx_project.py`
+
+Parses ETS `.knxproj` project files and bulk-creates all KNX entities found.
+
+Uses the [`xknxproject`](https://github.com/XKNX/xknxproject) library to extract
+group addresses, communication objects, and KNX functions from a project file,
+then determines the correct Home Assistant entity type using **only** KNX-level
+data: DPT numbers, communication-object flags, and device roles. No
+manufacturer-specific names, no language-dependent text matching.
+
+### Prerequisites
+
+- `pip install -r requirements.txt` (adds `xknxproject>=3.7.0`)
+- An ETS `.knxproj` project file (ETS5 or ETS6)
+- Project password if the file is encrypted
+
+### Usage
+
+```bash
+# Dry-run — see what would be created (default, safe)
+python3 parse_knx_project.py \
+  --project project.knxproj \
+  --password "ets-password"
+
+# Create all entities in Home Assistant
+python3 parse_knx_project.py \
+  --project project.knxproj \
+  --password "ets-password" \
+  --url "ws://homeassistant.local:8123/api/websocket" \
+  --token "$HA_TOKEN" \
+  --create \
+  --skip-existing
+
+# Export entity configs to JSON
+python3 parse_knx_project.py \
+  --project project.knxproj \
+  --password "ets-password" \
+  --output-json entities.json
+
+# Filter by entity type or location
+python3 parse_knx_project.py \
+  --project project.knxproj \
+  --password "ets-password" \
+  --create \
+  --filter-type light \
+  --filter-location "Living Room"
+```
+
+### How it works
+
+1. **Parse** the `.knxproj` via `xknxproject` → group addresses, devices,
+   communication objects, KNX functions.
+2. **Classify** each group address using DPT numbers, com-object flags
+   (`write`/`transmit`/`read`), and device roles (actuator vs. sensor vs.
+   lighting-gateway vs. thermostat-controller). No name matching.
+3. **Group** related addresses into Home Assistant entities using the KNX
+   project's function definitions (FT-1 = switchable light, FT-6 = dimmable
+   light, FT-8 = heating, FT-10 = switchable socket).
+4. **Create** entities via `update_knx_config`'s WebSocket API — validate,
+   then create, skipping existing entities when requested.
+
+### Entity type mapping
+
+| KNX Function | ETS usage | HA Platform |
+|-------------|-----------|-------------|
+| FT-1 | switchable light | `light` |
+| FT-6 | dimmable light | `light` (with brightness) |
+| FT-8 | heating | `climate` |
+| FT-10 | switchable socket | `switch` |
+| FT-0 (custom) | varies | heuristic (DPT-based) |
+| Unmapped binary inputs | — | `binary_sensor` (detected by device role) |
+
+### CLI Reference
+
+| Argument | Description |
+|---|---|
+| `--project` | Path to `.knxproj` file (required) |
+| `--password` | ETS project password. Also settable via `KNX_PROJECT_PASSWORD` env var |
+| `--create` | Actually create entities. Without this flag, performs a dry-run |
+| `--url` | HA WebSocket URL (default: `ws://localhost:8123/api/websocket`) |
+| `--token` | Long-lived access token. Falls back to `HA_TOKEN` env var |
+| `--skip-existing` | Skip entities already configured in Home Assistant |
+| `--output-json` | Write extracted entity configs to a JSON file |
+| `--no-meta` | Omit `_meta` fields from JSON output |
+| `--filter-type` | Only process `light`, `switch`, `binary_sensor`, `climate`, or `cover` |
+| `--filter-location` | Only process entities in a given room/location |
+| `--verbose` / `-v` | Verbose output with entity details |
+
 ## CLI Reference
 
 | Argument | Description |
