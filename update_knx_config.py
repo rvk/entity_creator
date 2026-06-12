@@ -15,6 +15,7 @@ KNX_WEBSOCKET_COMMANDS = {
     "update_entity": "knx/update_entity",
     "delete_entity": "knx/delete_entity",
     "get_entity_entries": "knx/get_entity_entries",
+    "get_entities_by_group": "knx/get_entities_by_group",
     "validate_entity": "knx/validate_entity",
     "get_schema": "knx/get_schema",
 }
@@ -78,6 +79,19 @@ async def get_entity_schema(websocket, msg_id, platform):
 async def get_entity_entries(websocket, msg_id):
     return await send_ws_message(
         websocket, msg_id, KNX_WEBSOCKET_COMMANDS["get_entity_entries"]
+    )
+
+
+async def get_entities_by_group(websocket, msg_id):
+    """Return the map of group address -> entity identifiers already bound.
+
+    The KNX integration answers with ``{result: {"1/2/3": [...], ...}}`` so the
+    keys are every group address currently used by an existing entity. Matching
+    on group address is the reliable dedup signal (entity unique_ids are
+    assigned server-side at creation and cannot be predicted here).
+    """
+    return await send_ws_message(
+        websocket, msg_id, KNX_WEBSOCKET_COMMANDS["get_entities_by_group"]
     )
 
 
@@ -204,7 +218,7 @@ def get_binary_sensor_config(name, state_address, device_class=None):
 def get_climate_config(
     name,
     temperature_state,
-    setpoint_write,
+    setpoint_write=None,
     setpoint_state=None,
     operation_mode_write=None,
     operation_mode_state=None,
@@ -224,7 +238,9 @@ def get_climate_config(
     Args:
         name: Entity name.
         temperature_state: Current temperature state address (e.g., "1/6/0").
-        setpoint_write: Setpoint write address (e.g., "1/6/3").
+        setpoint_write: Setpoint write address (e.g., "1/6/3"). If omitted, a
+            read-only thermostat is produced (no target_temperature block) —
+            never alias a write address onto the temperature sensor GA.
         setpoint_state: Setpoint state address (optional, e.g., "1/6/4").
         operation_mode_write: Operation mode write address (optional, DPT 20.102).
         operation_mode_state: Operation mode state address (optional).
@@ -239,15 +255,15 @@ def get_climate_config(
             f"got {controller_mode!r}"
         )
 
-    target_temperature = {"ga_temperature_target": {"write": setpoint_write}}
-    if setpoint_state:
-        target_temperature["ga_temperature_target"]["state"] = setpoint_state
-
     knx_config = {
         "ga_temperature_current": {"state": temperature_state},
-        "target_temperature": target_temperature,
         "default_controller_mode": controller_mode,
     }
+    if setpoint_write:
+        target_temperature = {"ga_temperature_target": {"write": setpoint_write}}
+        if setpoint_state:
+            target_temperature["ga_temperature_target"]["state"] = setpoint_state
+        knx_config["target_temperature"] = target_temperature
     if operation_mode_write:
         entry = {"write": operation_mode_write}
         if operation_mode_state:

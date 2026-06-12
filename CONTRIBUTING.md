@@ -177,10 +177,17 @@ One per platform, returning the `{"entity": …, "knx": …}` payload:
 
 ### Entity builders
 
-Each builder (`_build_light`, `_build_switch`, `_build_climate`,
-`_build_cover`) receives a group of related GAs (from a KNX function) and
-uses only DPT + flags + device roles to determine which GA is the switch
-write, switch state, brightness, setpoint, etc.
+Each builder (`_build_light`, `_build_switch`, `_build_climate`) receives a
+group of related GAs (from a KNX function) and uses only DPT + flags + device
+roles to determine which GA is the switch write, switch state, brightness,
+setpoint, etc.
+
+> **WIP:** `_build_cover` exists but is currently unreachable — no KNX
+> function type maps to the `cover` platform and the DPT heuristic
+> (`_heuristic_platform`) never returns `cover`, so blinds/shutters are not
+> extracted yet. `_build_binary_sensor` is likewise unused; binary sensors are
+> produced only by the unmapped-GA path via `get_binary_sensor_config`. Both
+> are kept as stubs for the planned shading/binary work.
 
 No manufacturer-specific com-object names are used. No
 language-dependent hardware names are matched. The classifiers work

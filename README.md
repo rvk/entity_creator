@@ -161,7 +161,15 @@ python3 parse_knx_project.py \
 | FT-8 | heating | `climate` |
 | FT-10 | switchable socket | `switch` |
 | FT-0 (custom) | varies | heuristic (DPT-based) |
+| Unmapped relay pairs | — | `switch` (write + state-feedback) |
 | Unmapped binary inputs | — | `binary_sensor` (detected by device role) |
+
+> **WIP / not yet supported by the parser:** `cover` (blind/shutter) entities
+> are **not** produced from project files yet — there is no KNX function-type
+> mapping for shading, so blinds are currently ignored or fall through to the
+> DPT heuristic. The single-entity CLI (`update_knx_config.py`) does support
+> `cover`; the batch parser does not. `climate` extraction also requires a
+> detectable setpoint and current-temperature GA in the function.
 
 ### CLI Reference
 
@@ -172,10 +180,10 @@ python3 parse_knx_project.py \
 | `--create` | Actually create entities. Without this flag, performs a dry-run |
 | `--url` | HA WebSocket URL (default: `ws://localhost:8123/api/websocket`) |
 | `--token` | Long-lived access token. Falls back to `HA_TOKEN` env var |
-| `--skip-existing` | Skip entities already configured in Home Assistant |
+| `--skip-existing` | Skip entities whose KNX group address is already bound to an existing entity in Home Assistant (matched by group address, not name) |
 | `--output-json` | Write extracted entity configs to a JSON file |
 | `--no-meta` | Omit `_meta` fields from JSON output |
-| `--filter-type` | Only process `light`, `switch`, `binary_sensor`, `climate`, or `cover` |
+| `--filter-type` | Only process `light`, `switch`, `binary_sensor`, or `climate`. (`cover` is accepted but the parser does not produce covers yet — see WIP note above.) |
 | `--filter-location` | Only process entities in a given room/location |
 | `--verbose` / `-v` | Verbose output with entity details |
 

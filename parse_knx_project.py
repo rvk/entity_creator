@@ -9,6 +9,7 @@ optionally creates them via entity_creator's WebSocket API.
 
 import argparse
 import asyncio
+import itertools
 import json
 import os
 import re
@@ -22,14 +23,13 @@ from xknxproject import XKNXProj
 from update_knx_config import (
     connect_and_authenticate,
     create_entity,
-    get_entity_entries,
+    get_entities_by_group,
     validate_entity,
     get_light_config,
     get_switch_config,
     get_binary_sensor_config,
     get_climate_config,
     get_cover_config,
-    CLIMATE_CONTROLLER_MODES,
 )
 
 
@@ -46,20 +46,14 @@ FUNCTION_TYPE_MAP: Dict[str, Dict[str, str]] = {
     # FT-0 is custom — need heuristic analysis
 }
 
-# DPT main number to descriptive name
-DPT_NAMES: Dict[int, str] = {
-    1: "1.xxx (1-bit)",
-    3: "3.xxx (4-bit dimming)",
-    5: "5.xxx (1-byte scaling)",
-    7: "7.xxx (2-byte unsigned)",
-    9: "9.xxx (2-byte float)",
-    10: "10.xxx (time)",
-    11: "11.xxx (date)",
-    13: "13.xxx (4-byte)",
-    14: "14.xxx (4-byte float)",
-    18: "18.xxx (scene)",
-    20: "20.xxx (HVAC)",
-    27: "27.xxx (combined info)",
+# Human-readable reasons used when a builder cannot produce an entity, keyed
+# by the platform that was attempted. Surfaced in the skip report (see main()).
+_PLATFORM_SKIP_REASON: Dict[str, str] = {
+    "light": "no switch write GA (DPT 1) found",
+    "switch": "no switch write GA (DPT 1) found",
+    "climate": "no current-temperature GA (DPT 9) found",
+    "cover": "no up/down GA found",
+    "binary_sensor": "no usable state GA found",
 }
 
 
@@ -94,31 +88,6 @@ def _clean_entity_name(raw: str) -> str:
     name = re.sub(r"\s+", " ", name)
     name = name.strip()
     return name
-
-
-def _determine_flags_role(ga_data: dict, com_objects: dict) -> Optional[str]:
-    """Determine GA role from communication object flags.
-
-    Returns 'write', 'state', 'both', or None.
-    """
-    roles = set()
-    for co_id in ga_data.get("communication_object_ids", []):
-        co = com_objects.get(co_id, {})
-        flags = co.get("flags", {})
-        if flags.get("write"):
-            roles.add("write")
-        if flags.get("transmit") and not flags.get("write"):
-            roles.add("state")
-        if flags.get("read") and not flags.get("write") and not flags.get("transmit"):
-            roles.add("state")
-
-    if "write" in roles and "state" in roles:
-        return "both"
-    if "write" in roles:
-        return "write"
-    if "state" in roles:
-        return "state"
-    return None
 
 
 def _classify_com_object(co: dict) -> Dict[str, Any]:
@@ -279,10 +248,17 @@ def _classify_ga(ga_data: dict, com_objects: dict, devices: dict) -> Dict[str, A
 
 def _extract_from_functions(
     project: dict,
+    skipped: Optional[List[Dict[str, str]]] = None,
 ) -> List[Dict[str, Any]]:
     """Extract entities from KNX functions (the most reliable source).
 
     Each function groups related GAs and specifies a function type.
+
+    Args:
+        project: Parsed xknxproject dict.
+        skipped: Optional list; functions that could not be turned into an
+            entity are appended as ``{"name", "function_type", "reason"}`` so
+            callers can report them instead of dropping them silently.
     """
     functions = project.get("functions", {})
     group_addresses = project.get("group_addresses", {})
@@ -291,6 +267,10 @@ def _extract_from_functions(
 
     entities: List[Dict[str, Any]] = []
 
+    def _skip(name: str, fn_type: str, reason: str) -> None:
+        if skipped is not None:
+            skipped.append({"name": name, "function_type": fn_type, "reason": reason})
+
     for fn_id, fn in functions.items():
         fn_type = fn.get("function_type", "")
         fn_name = fn.get("name", fn_id)
@@ -298,6 +278,7 @@ def _extract_from_functions(
         usage = fn.get("usage_text", "")
 
         if not fn_gas:
+            _skip(fn_name, fn_type, "function has no group addresses")
             continue
 
         # Determine platform from function type
@@ -327,6 +308,7 @@ def _extract_from_functions(
 
         if entity_data:
             entity_data["_meta"] = {
+                "platform": platform,
                 "function_id": fn_id,
                 "function_type": fn_type,
                 "function_name": fn_name,
@@ -335,8 +317,75 @@ def _extract_from_functions(
                 "space_id": space_id,
             }
             entities.append(entity_data)
+        else:
+            _skip(
+                fn_name,
+                fn_type,
+                _PLATFORM_SKIP_REASON.get(
+                    platform, f"no usable group addresses for platform '{platform}'"
+                ),
+            )
 
     return entities
+
+
+def _switch_role(cls: Dict[str, Any]) -> Optional[str]:
+    """Classify a DPT-1 GA as a switch 'write' or 'state' from its flags."""
+    if cls["has_write"] and not cls["has_transmit"]:
+        return "write"
+    if cls["has_transmit"] and not cls["has_write"]:
+        return "state"
+    if cls["has_write"]:
+        return "write"
+    if cls["has_transmit"]:
+        return "state"
+    return None
+
+
+def _actuator_grouping(
+    ga: dict, com_objects: dict
+) -> Tuple[Optional[tuple], Optional[int], int]:
+    """Return ``(channel_key, order, num_devices)`` for a DPT-1 actuator GA.
+
+    Pairing of a switch-write GA with its status-feedback GA is driven by the
+    actuator's channel structure rather than by GA-address adjacency:
+
+    - ``channel_key`` groups GAs that belong to the same actuator channel. It
+      is ``(device, channel)`` when ETS exposes channel info, otherwise it
+      falls back to ``(device,)`` (group by device).
+    - ``order`` is the communication-object number — the device's own channel
+      layout order — used to pair the n-th write with the n-th status object.
+    - ``num_devices`` is how many distinct devices the GA's DPT-1 objects touch;
+      ``> 1`` marks a central/group command (not a single channel), which is
+      left to the adjacency fallback instead.
+    """
+    dev_to_num: Dict[str, int] = {}
+    channels: set = set()
+    for co_id in ga.get("communication_object_ids", []):
+        co = com_objects.get(co_id, {})
+        cc = _classify_com_object(co)
+        if not cc["has_dpt1"]:
+            continue
+        dev = co.get("device_address") or ""
+        if not dev:
+            continue
+        num = co.get("number")
+        if isinstance(num, int):
+            dev_to_num[dev] = min(dev_to_num.get(dev, num), num)
+        else:
+            dev_to_num.setdefault(dev, 0)
+        chan = co.get("channel")
+        if chan:
+            channels.add((dev, chan))
+
+    if not dev_to_num:
+        return None, None, 0
+
+    primary_dev = min(dev_to_num, key=lambda d: dev_to_num[d])
+    order = dev_to_num[primary_dev]
+    chan_key = next((c for c in channels if c[0] == primary_dev), None)
+    key = chan_key if chan_key is not None else (primary_dev,)
+    return key, order, len(dev_to_num)
 
 
 def _extract_unmapped(
@@ -353,28 +402,71 @@ def _extract_unmapped(
     entities = []
     consumed = set()
 
-    # --- Step 1: Pair unmapped relay switch-write + status-feedback ---
-    unmapped_actuator = []
+    def _emit_switch(name: str, write_addr: str, state_addr: Optional[str]) -> None:
+        entity_data = get_switch_config(
+            name=name, address=write_addr, state_address=state_addr
+        )
+        entity_data["_meta"] = {
+            "platform": "switch",
+            "function_id": None,
+            "function_type": None,
+            "function_name": name,
+            "usage_text": "unmapped relay channel",
+            "space": "",
+            "space_id": "",
+        }
+        entities.append(entity_data)
+
+    # --- Step 1: Pair unmapped relay write + status-feedback by actuator channel ---
+    # Group each single-device DPT-1 actuator GA by its (device, channel); pair
+    # the n-th write object with the n-th status object in channel-layout order.
+    # GAs that span multiple devices (central/group commands) or expose no
+    # device info fall through to the address-adjacency heuristic below.
+    channel_groups: Dict[tuple, Dict[str, List[tuple]]] = defaultdict(
+        lambda: {"write": [], "state": []}
+    )
+    adjacency_fallback: List[Tuple[str, dict]] = []
+
     for addr, ga in group_addresses.items():
         if addr in mapped_addresses:
             continue
         cls = _classify_ga(ga, com_objects, devices)
-        if cls["dpt_main"] != 1:
+        if cls["dpt_main"] != 1 or not cls["is_pure_actuator"]:
             continue
-        if not cls["is_pure_actuator"]:
+        role = _switch_role(cls)
+        if role is None:
             continue
-        unmapped_actuator.append((addr, ga))
+        key, order, num_devices = _actuator_grouping(ga, com_objects)
+        if key is None or num_devices != 1:
+            # No device info, or a central command across many devices.
+            adjacency_fallback.append((addr, ga))
+            continue
+        channel_groups[key][role].append((order if order is not None else 0, addr, ga))
 
-    unmapped_actuator.sort(key=lambda x: x[1].get("raw_address", 0))
+    for group in channel_groups.values():
+        writes = sorted(group["write"])
+        states = sorted(group["state"])
+        for idx, (_, w_addr, w_ga) in enumerate(writes):
+            s_addr = states[idx][1] if idx < len(states) else None
+            _emit_switch(_clean_entity_name(w_ga["name"]), w_addr, s_addr)
+            consumed.add(w_addr)
+            if idx < len(states):
+                consumed.add(states[idx][1])
+
+    # --- Step 1b: Address-adjacency fallback (only when channel info is absent) ---
+    adjacency_fallback.sort(key=lambda x: x[1].get("raw_address", 0))
 
     i = 0
-    while i < len(unmapped_actuator) - 1:
-        addr_a, ga_a = unmapped_actuator[i]
-        addr_b, ga_b = unmapped_actuator[i + 1]
+    while i < len(adjacency_fallback) - 1:
+        addr_a, ga_a = adjacency_fallback[i]
+        addr_b, ga_b = adjacency_fallback[i + 1]
+        if addr_a in consumed:
+            i += 1
+            continue
         raw_a = ga_a.get("raw_address", 0)
         raw_b = ga_b.get("raw_address", 0)
 
-        if raw_b - raw_a == 1:
+        if raw_b - raw_a == 1 and addr_b not in consumed:
             cls_a = _classify_ga(ga_a, com_objects, devices)
             cls_b = _classify_ga(ga_b, com_objects, devices)
 
@@ -395,19 +487,7 @@ def _extract_unmapped(
                 i += 1
                 continue
 
-            name = _clean_entity_name(ga_a["name"])
-            entity_data = get_switch_config(
-                name=name, address=switch_write, state_address=switch_state
-            )
-            entity_data["_meta"] = {
-                "function_id": None,
-                "function_type": None,
-                "function_name": name,
-                "usage_text": "unmapped relay channel",
-                "space": "",
-                "space_id": "",
-            }
-            entities.append(entity_data)
+            _emit_switch(_clean_entity_name(ga_a["name"]), switch_write, switch_state)
             consumed.update([addr_a, addr_b])
             i += 2
         else:
@@ -424,6 +504,7 @@ def _extract_unmapped(
             name = _clean_entity_name(ga["name"]) or f"Binary {addr}"
             entity_data = get_binary_sensor_config(name=name, state_address=addr)
             entity_data["_meta"] = {
+                "platform": "binary_sensor",
                 "function_id": None,
                 "function_type": None,
                 "function_name": ga["name"],
@@ -640,10 +721,12 @@ def _build_climate(
     if temp_state is None:
         return None
 
+    # If no setpoint write GA was detected, build a read-only thermostat.
+    # Never alias a write address onto the temperature sensor GA.
     return get_climate_config(
         name=name,
         temperature_state=temp_state,
-        setpoint_write=setpoint_write or temp_state,
+        setpoint_write=setpoint_write,
         on_off_write=on_off_write,
         controller_mode="heat",
     )
@@ -725,6 +808,29 @@ def _heuristic_platform(
     return "switch"
 
 
+def _platform_from_payload(ent: Dict[str, Any]) -> str:
+    """Defensive fallback: infer platform from a built payload's shape.
+
+    Builders normally record the platform in ``_meta`` at extraction time;
+    this is only used if that value is missing.
+    """
+    knx = ent.get("knx", {})
+    if "ga_sensor" in knx:
+        return "binary_sensor"
+    if "ga_up_down" in knx:
+        return "cover"
+    if "ga_temperature_current" in knx:
+        return "climate"
+    if "ga_switch" in knx:
+        if "ga_brightness" in knx or "color" in knx or "ga_color_temp" in knx:
+            return "light"
+        fn_type = ent.get("_meta", {}).get("function_type", "")
+        if fn_type in ("FT-1", "FT-6"):
+            return "light"
+        return "switch"
+    return "?"
+
+
 def _resolve_space_name(space_id: str, locations: dict) -> str:
     """Find a space name by its identifier."""
     if not space_id:
@@ -747,16 +853,25 @@ def _resolve_space_name(space_id: str, locations: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def extract_entities(project: dict) -> List[Dict[str, Any]]:
+def extract_entities(
+    project: dict,
+    skipped: Optional[List[Dict[str, str]]] = None,
+) -> List[Dict[str, Any]]:
     """Extract all Home Assistant entities from a parsed KNX project.
 
     Returns a list of entity payloads (same format as update_knx_config builders).
     Each payload has an added ``_meta`` key with KNX-specific metadata.
+
+    Args:
+        project: Parsed xknxproject dict.
+        skipped: Optional list populated with functions that could not be
+            converted to an entity (each ``{"name", "function_type", "reason"}``),
+            so callers can report them instead of dropping them silently.
     """
     entities = []
 
     # 1. Extract from functions (most reliable)
-    function_entities = _extract_from_functions(project)
+    function_entities = _extract_from_functions(project, skipped=skipped)
     entities.extend(function_entities)
 
     # Track which GAs were already mapped
@@ -837,6 +952,30 @@ def entities_to_json(entities: List[Dict[str, Any]], include_meta: bool = True) 
 # ---------------------------------------------------------------------------
 
 
+def _entity_group_addresses(payload: Dict[str, Any]) -> set:
+    """Collect every KNX group address referenced by an entity payload.
+
+    Walks the ``knx`` config recursively and returns all values stored under
+    ``write`` / ``state`` / ``passive`` keys. Used to de-duplicate against the
+    group addresses already bound in Home Assistant.
+    """
+    found: set = set()
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in ("write", "state", "passive") and isinstance(value, str):
+                    found.add(value)
+                else:
+                    _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(payload.get("knx", {}))
+    return found
+
+
 async def create_entities_batch(
     entities: List[Dict[str, Any]],
     url: str,
@@ -890,17 +1029,19 @@ async def create_entities_batch(
 
     summary = {"total": len(filtered), "created": 0, "skipped": 0, "failed": 0}
 
-    try:
-        # Get existing entities for skip_existing
-        existing_names = set()
-        if skip_existing:
-            entries_result = await get_entity_entries(websocket, 1)
-            existing = entries_result.get("result", [])
-            existing_names = {
-                e.get("entity", e.get("entity_id", "")).split(".")[-1] for e in existing
-            }
+    # Single monotonic message-id source for every request in this session,
+    # so ids can never collide regardless of how many calls are made.
+    next_id = itertools.count(1).__next__
 
-        msg_id = 10  # Start higher to avoid conflicts
+    try:
+        # Get the group addresses already bound to existing entities. Matching
+        # on group address (not display name) is the reliable dedup signal:
+        # the KNX UI assigns entity unique_ids server-side at creation, so they
+        # cannot be predicted here, and names are locale/slug sensitive.
+        existing_gas = set()
+        if skip_existing:
+            grp_result = await get_entities_by_group(websocket, next_id())
+            existing_gas = set((grp_result.get("result") or {}).keys())
 
         for i, ent in enumerate(filtered):
             meta = ent.get("_meta", {})
@@ -911,21 +1052,24 @@ async def create_entities_batch(
             # Strip _meta before sending
             payload = {k: v for k, v in ent.items() if k != "_meta"}
 
-            # Check existing
-            if (
-                skip_existing
-                and entity_name.lower().replace(" ", "_") in existing_names
-            ):
-                print(f"  [{i + 1}/{len(filtered)}] SKIP (existing): {entity_name}")
-                summary["skipped"] += 1
-                continue
+            # Skip if any of this entity's group addresses is already bound.
+            if skip_existing:
+                already = _entity_group_addresses(payload) & existing_gas
+                if already:
+                    print(
+                        f"  [{i + 1}/{len(filtered)}] SKIP (existing GA "
+                        f"{', '.join(sorted(already))}): {entity_name}"
+                    )
+                    summary["skipped"] += 1
+                    continue
 
             print(f"  [{i + 1}/{len(filtered)}] Creating {platform}: {entity_name}")
 
             try:
                 # Validate
-                val_result = await validate_entity(websocket, msg_id, platform, payload)
-                msg_id += 1
+                val_result = await validate_entity(
+                    websocket, next_id(), platform, payload
+                )
 
                 if not (
                     val_result.get("success")
@@ -937,9 +1081,8 @@ async def create_entities_batch(
 
                 # Create
                 create_result = await create_entity(
-                    websocket, msg_id, platform, payload
+                    websocket, next_id(), platform, payload
                 )
-                msg_id += 1
 
                 if create_result.get("success"):
                     print(f"    OK")
@@ -1091,39 +1234,27 @@ def main():
     print(f"  Locations: {len(project.get('locations', {}))}")
 
     # Extract entities
-    entities = extract_entities(project)
+    skipped: List[Dict[str, str]] = []
+    entities = extract_entities(project, skipped=skipped)
+
+    # Report functions that could not be converted, so they don't vanish.
+    if skipped:
+        print(f"\nSkipped {len(skipped)} function(s) (no entity created):")
+        for s in skipped:
+            ft = s.get("function_type") or "?"
+            print(f"  - {s['name']!r} [{ft}]: {s['reason']}")
 
     if not entities:
         print("\nNo entities could be extracted from the project.")
         return
 
-    # Add platform to _meta for each entity
+    # Platform is set by the builders at extraction time (see
+    # _extract_from_functions / _extract_unmapped). As a defensive safety net
+    # only, backfill it from the payload shape if it is somehow missing.
     for ent in entities:
         meta = ent.setdefault("_meta", {})
-        if "platform" not in meta:
-            # Determine platform from entity structure
-            knx = ent.get("knx", {})
-            if "ga_sensor" in knx:
-                meta["platform"] = "binary_sensor"
-            elif "ga_up_down" in knx:
-                meta["platform"] = "cover"
-            elif "ga_temperature_current" in knx:
-                meta["platform"] = "climate"
-            elif "ga_switch" in knx:
-                # Could be light or switch; check for brightness/color
-                if "ga_brightness" in knx or "color" in knx or "ga_color_temp" in knx:
-                    meta["platform"] = "light"
-                else:
-                    # Check function type for hint
-                    fn_type = meta.get("function_type", "")
-                    if fn_type == "FT-1" or fn_type == "FT-6":
-                        meta["platform"] = "light"
-                    elif fn_type == "FT-10":
-                        meta["platform"] = "switch"
-                    else:
-                        meta["platform"] = "switch"  # default heuristic
-            else:
-                meta["platform"] = "?"
+        if not meta.get("platform"):
+            meta["platform"] = _platform_from_payload(ent)
 
     # JSON output (always do this first, doesn't conflict with create)
     if args.output_json:
