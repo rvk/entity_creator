@@ -30,6 +30,11 @@ from update_knx_config import (
     get_binary_sensor_config,
     get_climate_config,
     get_cover_config,
+    list_floors,
+    create_floor,
+    list_areas,
+    create_area,
+    update_entity_area,
 )
 
 
@@ -291,9 +296,9 @@ def _extract_from_functions(
 
         entity_name = _clean_entity_name(fn_name)
 
-        # Get location/space name
+        # Get location/space name and floor
         space_id = fn.get("space_id", "")
-        space_name = _resolve_space_name(space_id, locations)
+        space_name, floor_name = _resolve_space_with_floor(space_id, locations)
 
         # Build entity based on platform
         entity_data = _build_entity_for_platform(
@@ -315,6 +320,7 @@ def _extract_from_functions(
                 "usage_text": usage,
                 "space": space_name,
                 "space_id": space_id,
+                "floor": floor_name,
             }
             entities.append(entity_data)
         else:
@@ -831,21 +837,138 @@ def _platform_from_payload(ent: Dict[str, Any]) -> str:
     return "?"
 
 
-def _resolve_space_name(space_id: str, locations: dict) -> str:
-    """Find a space name by its identifier."""
-    if not space_id:
-        return ""
+def _resolve_space_with_floor(space_id: str, locations: dict) -> Tuple[str, str]:
+    """Find a space name and its containing floor name by identifier.
 
-    def _search(spaces: dict, target: str) -> Optional[str]:
+    Returns a ``(space_name, floor_name)`` tuple.  ``floor_name`` is built by
+    joining every ancestor node name with ``" - "``.  When there are no
+    ancestors the floor name is an empty string.
+    """
+    if not space_id:
+        return "", ""
+
+    def _search(
+        spaces: dict, target: str, parent_path: list
+    ) -> Optional[Tuple[str, str]]:
         for name, space in spaces.items():
             if space.get("identifier") == target:
-                return name
-            result = _search(space.get("spaces", {}), target)
+                floor = " - ".join(parent_path) if parent_path else ""
+                return name, floor
+            result = _search(space.get("spaces", {}), target, parent_path + [name])
             if result:
                 return result
         return None
 
-    return _search(locations, space_id) or ""
+    result = _search(locations, space_id, [])
+    return result if result else ("", "")
+
+
+def extract_location_hierarchy(locations: dict) -> Dict[str, Any]:
+    """Walk the ETS location tree and extract floors and areas.
+
+    ETS locations form a tree (e.g. Building → Floor → Room).  This function:
+
+    * Records nodes as HA Areas — both leaf rooms and intermediate
+      containers (which can also have KNX functions assigned).
+      ``DistributionBoard`` nodes (cabinets) are intentionally skipped and
+      are **not** turned into areas.
+    * Builds HA Floors from ancestor paths: each unique ancestor chain that
+      appears as a ``floor_name`` on any area becomes a floor.
+    * Assigns a numeric ``level`` to each floor in tree-traversal order.
+
+    Returns a dict::
+
+        {
+            "floors": [
+                {"name": "Building A - Ground Floor", "level": 0},
+                ...
+            ],
+            "areas": [
+                {"name": "Living Room",   "floor_name": "Building A - Ground Floor"},
+                {"name": "Building A",     "floor_name": ""},
+                ...
+            ],
+        }
+    """
+    areas: List[Dict[str, Any]] = []
+    floor_names: Dict[str, int] = {}  # floor_name → level
+
+    def _walk(spaces: dict, parent_path: list) -> None:
+        for name, space in spaces.items():
+            children = space.get("spaces", {})
+            current_path = parent_path + [name]
+
+            # DistributionBoard nodes (cabinets) are not rooms — skip them
+            # from the area list.  Still recurse into children (unlikely in
+            # practice since cabinets are typically leaf nodes).
+            if space.get("type") != "DistributionBoard":
+                floor = " - ".join(parent_path) if parent_path else ""
+                areas.append({"name": name, "floor_name": floor})
+
+            # Recurse into children if any
+            if children:
+                _walk(children, current_path)
+
+    _walk(locations, [])
+
+    # Build floor list from the areas we found
+    for area in areas:
+        fn = area["floor_name"]
+        if fn and fn not in floor_names:
+            floor_names[fn] = len(floor_names)
+
+    floors = [
+        {"name": name, "level": level}
+        for name, level in sorted(floor_names.items(), key=lambda x: x[1])
+    ]
+
+    return {"floors": floors, "areas": areas}
+
+
+def collect_spaces_with_functions(entities: List[Dict[str, Any]]) -> set:
+    """Return the set of ``(area_name, floor_name)`` tuples for every space
+    that has at least one extracted entity (i.e. a KNX function assigned)."""
+    spaces: set = set()
+    for ent in entities:
+        meta = ent.get("_meta", {})
+        area = meta.get("space", "")
+        floor = meta.get("floor", "")
+        if area:
+            spaces.add((area, floor))
+    return spaces
+
+
+def build_cabinet_promotions(
+    locations: dict,
+) -> Dict[str, Tuple[str, str]]:
+    """Build a map of DistributionBoard-name → (parent_area_name, parent_floor_name).
+
+    DistributionBoard nodes in ETS (cabinets, sub-panels, …) are explicitly
+    typed by their ``Type`` XML attribute.  They should never become HA
+    Areas — their entities belong to the containing parent area.
+
+    Returns:
+        ``{cabinet_name: (area_name, floor_name), ...}`` mapping each
+        cabinet to the parent area/floor it should be promoted into.
+    """
+    promotions: Dict[str, Tuple[str, str]] = {}
+
+    def _walk(spaces: dict, parent_path: list) -> None:
+        for name, space in spaces.items():
+            space_type = space.get("type", "")
+            children = space.get("spaces", {})
+
+            if space_type == "DistributionBoard":
+                pname = parent_path[-1] if parent_path else ""
+                parent_floor = (
+                    " - ".join(parent_path[:-1]) if len(parent_path) > 1 else ""
+                )
+                promotions[name] = (pname, parent_floor)
+
+            _walk(children, parent_path + [name])
+
+    _walk(locations, [])
+    return promotions
 
 
 # ---------------------------------------------------------------------------
@@ -976,6 +1099,153 @@ def _entity_group_addresses(payload: Dict[str, Any]) -> set:
     return found
 
 
+async def create_floors_and_areas(
+    hierarchy: Dict[str, Any],
+    active_spaces: set,
+    websocket,
+    next_id,
+    create_all_rooms: bool = False,
+) -> Dict[str, str]:
+    """Create HA floors and areas from the KNX project location tree.
+
+    Always skips floors and areas that already exist in Home Assistant (matched
+    by name).  Only creates areas whose ``(area_name, floor_name)`` is present
+    in ``active_spaces``, unless ``create_all_rooms`` is ``True``.
+
+    Args:
+        hierarchy: Result of :func:`extract_location_hierarchy`.
+        active_spaces: ``{(area_name, floor_name), ...}`` — rooms that contain
+            at least one KNX function.  Ignored when *create_all_rooms*.
+        websocket: Authenticated HA WebSocket connection.
+        next_id: Monotonic message-id factory (``itertools.count(1).__next__``).
+        create_all_rooms: If ``True``, create areas for *all* rooms in the
+            project, not just those with functions.
+
+    Returns:
+        A dict mapping ``(area_name, floor_name)`` → **area_id** for every
+        area that exists in HA (both newly created and pre-existing).  Keying
+        by the (name, floor) tuple avoids collisions when the same room name
+        appears on different floors.  Callers use this to assign entities to
+        their area after entity creation.
+    """
+    all_floors = hierarchy.get("floors", [])
+    all_areas = hierarchy.get("areas", [])
+
+    # ---- determine which areas to create ----
+    areas_to_create: List[Dict[str, Any]] = []
+    if create_all_rooms:
+        areas_to_create = list(all_areas)
+    else:
+        for area in all_areas:
+            key = (area["name"], area.get("floor_name"))
+            if key in active_spaces:
+                areas_to_create.append(area)
+
+    # Build the set of floor names these areas need
+    needed_floor_names: set = set()
+    for area in areas_to_create:
+        fn = area.get("floor_name")
+        if fn:
+            needed_floor_names.add(fn)
+
+    floors_to_create = [f for f in all_floors if f["name"] in needed_floor_names]
+
+    print("\n--- HA Location Structure ---")
+    print(f"  Floors needed:   {len(floors_to_create)}")
+    print(f"  Areas to create: {len(areas_to_create)}")
+    for f in floors_to_create:
+        print(f"    Floor: {f['name']} (level={f['level']})")
+    for a in areas_to_create:
+        parent = f" [{a['floor_name']}]" if a.get("floor_name") else ""
+        print(f"    Area:  {a['name']}{parent}")
+
+    # ---- fetch existing floors / areas from HA ----
+    existing_floors_resp = await list_floors(websocket, next_id())
+    existing_floors = existing_floors_resp.get("result") or []
+    existing_floor_by_name: Dict[str, str] = {
+        f["name"]: f["floor_id"] for f in existing_floors
+    }
+
+    existing_areas_resp = await list_areas(websocket, next_id())
+    existing_areas = existing_areas_resp.get("result") or []
+    # Map existing HA areas to their floor name so we can key by
+    # (name, floor_name) and avoid colliding same-named rooms on
+    # different floors.
+    existing_floor_name_by_id: Dict[str, str] = {
+        f["floor_id"]: f["name"] for f in existing_floors
+    }
+    existing_area_by_name: Dict[tuple, str] = {
+        (a["name"], existing_floor_name_by_id.get(a.get("floor_id"), "")): a["area_id"]
+        for a in existing_areas
+    }
+
+    # ---- create floors ----
+    ha_floor_ids: Dict[str, str] = dict(existing_floor_by_name)  # name → floor_id
+    created_floors = 0
+    skipped_floors = 0
+
+    for floor in floors_to_create:
+        name = floor["name"]
+        if name in existing_floor_by_name:
+            print(f"  SKIP floor (exists): {name}")
+            skipped_floors += 1
+            continue
+        result = await create_floor(
+            websocket, next_id(), name, level=floor.get("level")
+        )
+        if result.get("success") and result.get("result", {}).get("floor_id"):
+            fid = result["result"]["floor_id"]
+            ha_floor_ids[name] = fid
+            created_floors += 1
+            print(f"  OK floor: {name} → {fid}")
+        else:
+            print(f"  FAIL floor: {name}: {result}")
+
+    # ---- create areas ----
+    # Keyed by (name, floor_name) so same-named rooms on different floors
+    # don't collide.
+    ha_area_ids: Dict[tuple, str] = dict(existing_area_by_name)
+    created_areas = 0
+    skipped_areas = 0
+
+    for area in areas_to_create:
+        name = area["name"]
+        floor_name = area.get("floor_name") or ""
+        if (name, floor_name) in existing_area_by_name:
+            print(f"  SKIP area (exists): {name}")
+            skipped_areas += 1
+            continue
+
+        if floor_name:
+            floor_id = ha_floor_ids.get(floor_name)
+        elif area["name"] in ha_floor_ids:
+            # Self-referencing: this area and a floor share the same
+            # name (e.g. "Outdoor Area" is both a container and a
+            # location in its own right).  Nest the area under the
+            # matching floor.
+            floor_id = ha_floor_ids[area["name"]]
+        else:
+            floor_id = None
+        result = await create_area(websocket, next_id(), name, floor_id=floor_id)
+        if result.get("success") and result.get("result", {}).get("area_id"):
+            aid = result["result"]["area_id"]
+            ha_area_ids[(name, floor_name)] = aid
+            created_areas += 1
+            print(
+                f"  OK area: {name} → {aid}"
+                + (f" (floor={floor_id})" if floor_id else "")
+            )
+        else:
+            print(f"  FAIL area: {name}: {result}")
+
+    print(
+        f"  Floors: {created_floors} created, {skipped_floors} skipped; "
+        f"Areas: {created_areas} created, {skipped_areas} skipped"
+    )
+
+    return ha_area_ids
+
+
 async def create_entities_batch(
     entities: List[Dict[str, Any]],
     url: str,
@@ -984,6 +1254,9 @@ async def create_entities_batch(
     skip_existing: bool = True,
     filter_platform: Optional[str] = None,
     filter_location: Optional[str] = None,
+    area_map: Optional[Dict[tuple, str]] = None,
+    websocket: Any = None,
+    next_id: Any = None,
 ) -> Dict[str, Any]:
     """Create multiple entities via the HA WebSocket API.
 
@@ -995,6 +1268,15 @@ async def create_entities_batch(
         skip_existing: If True, skip entities already in HA.
         filter_platform: Only process entities of this platform.
         filter_location: Only process entities in this location/space.
+        area_map: Optional ``{(area_name, floor_name): area_id}`` mapping.
+            When provided, each successfully created entity is assigned to its
+            area via ``config/entity_registry/update``.
+        websocket: Optional pre-existing authenticated WebSocket connection.
+            When supplied the function reuses it instead of opening a new one
+            (the caller is responsible for closing).
+        next_id: Optional monotonic message-id factory
+            (``itertools.count(1).__next__``).  When a shared *websocket* is
+            provided this MUST be supplied to avoid id-reuse errors.
 
     Returns:
         Summary dict with success/failure counts.
@@ -1023,15 +1305,25 @@ async def create_entities_batch(
         print(f"\n[Dry run] Would create {len(filtered)} entities.")
         return {"total": len(filtered), "created": 0, "skipped": 0, "failed": 0}
 
-    # Connect and authenticate
-    print(f"Connecting to {url}...")
-    websocket = await connect_and_authenticate(url, token)
+    # Reusing a shared websocket without a shared id source would restart
+    # message ids at 1 and collide with ids already used on that socket.
+    if websocket is not None and next_id is None:
+        raise ValueError(
+            "next_id must be supplied when reusing an existing websocket connection"
+        )
+
+    # Connect and authenticate (reuse existing websocket if provided)
+    own_ws = websocket is None
+    if own_ws:
+        print(f"Connecting to {url}...")
+        websocket = await connect_and_authenticate(url, token)
 
     summary = {"total": len(filtered), "created": 0, "skipped": 0, "failed": 0}
 
     # Single monotonic message-id source for every request in this session,
     # so ids can never collide regardless of how many calls are made.
-    next_id = itertools.count(1).__next__
+    if next_id is None:
+        next_id = itertools.count(1).__next__
 
     try:
         # Get the group addresses already bound to existing entities. Matching
@@ -1085,8 +1377,26 @@ async def create_entities_batch(
                 )
 
                 if create_result.get("success"):
-                    print(f"    OK")
+                    entity_id = create_result.get("result", {}).get("entity_id")
+                    print(f"    OK" + (f" → {entity_id}" if entity_id else ""))
                     summary["created"] += 1
+
+                    # Assign entity to its area if we have a mapping.
+                    # Look up by (space, floor) so same-named rooms on
+                    # different floors resolve to the correct area.  An
+                    # entity with empty space/floor resolves to None.
+                    if area_map and entity_id:
+                        space = meta.get("space", "")
+                        floor = meta.get("floor", "")
+                        area_id = area_map.get((space, floor))
+                        if area_id:
+                            try:
+                                await update_entity_area(
+                                    websocket, next_id(), entity_id, area_id
+                                )
+                                print(f"    → assigned to area '{space}' ({area_id})")
+                            except Exception as exc:
+                                print(f"    → failed to assign area: {exc}")
                 else:
                     print(f"    Failed: {json.dumps(create_result, indent=4)}")
                     summary["failed"] += 1
@@ -1096,8 +1406,9 @@ async def create_entities_batch(
                 summary["failed"] += 1
 
     finally:
-        await websocket.close()
-        print("Connection closed.")
+        if own_ws:
+            await websocket.close()
+            print("Connection closed.")
 
     return summary
 
@@ -1194,6 +1505,19 @@ Examples:
         "--filter-location",
         help="Only process entities in this location/room.",
     )
+    parser.add_argument(
+        "--skip-rooms",
+        action="store_true",
+        help="Do not create HA areas/floors from project locations. "
+        "Entities will not be assigned to areas either.",
+    )
+    parser.add_argument(
+        "--create-all-rooms",
+        action="store_true",
+        help="Create HA areas/floors for ALL rooms found in the project, "
+        "even those without any mapped KNX functions. "
+        "By default only rooms that contain functions are created.",
+    )
 
     return parser
 
@@ -1212,7 +1536,7 @@ def _resolve_password(args) -> str:
     return args.password or os.environ.get("KNX_PROJECT_PASSWORD", "")
 
 
-def main():
+async def main():
     args = _build_arg_parser().parse_args()
     password = _resolve_password(args)
 
@@ -1256,6 +1580,26 @@ def main():
         if not meta.get("platform"):
             meta["platform"] = _platform_from_payload(ent)
 
+    # Promote cabinet functions to their parent area.  In ETS, distribution
+    # cabinets (DB-01, DB-02, …) sit inside areas (North Zone,
+    # South Zone, …).  If both cabinet and parent have functions, the
+    # cabinet is NOT an area — its entities belong to the parent.
+    locations = project.get("locations", {})
+    if locations:
+        promotions = build_cabinet_promotions(locations)
+        if promotions:
+            for ent in entities:
+                meta = ent.get("_meta", {})
+                space = meta.get("space", "")
+                if space in promotions:
+                    parent_area, parent_floor = promotions[space]
+                    meta["space"] = parent_area
+                    meta["floor"] = parent_floor
+            print(f"\nPromoted {len(promotions)} cabinet(s) to parent areas:")
+            for cab, (area, floor) in sorted(promotions.items()):
+                fn = f" [{floor}]" if floor else ""
+                print(f"  {cab} → {area}{fn}")
+
     # JSON output (always do this first, doesn't conflict with create)
     if args.output_json:
         json_str = entities_to_json(entities, include_meta=not args.no_meta)
@@ -1270,8 +1614,45 @@ def main():
     # Create entities if requested
     if args.create:
         token = _resolve_token(args)
-        summary = asyncio.run(
-            create_entities_batch(
+        area_map: Dict[tuple, str] = {}
+        create_rooms = not args.skip_rooms
+
+        if create_rooms and locations:
+            hierarchy = extract_location_hierarchy(locations)
+            active_spaces = collect_spaces_with_functions(entities)
+
+            # Connect once and reuse for both room + entity creation.
+            print(f"\nConnecting to {args.url}...")
+            websocket = await connect_and_authenticate(args.url, token)
+            next_id = itertools.count(1).__next__
+            try:
+                area_map = await create_floors_and_areas(
+                    hierarchy=hierarchy,
+                    active_spaces=active_spaces,
+                    websocket=websocket,
+                    next_id=next_id,
+                    create_all_rooms=args.create_all_rooms,
+                )
+
+                summary = await create_entities_batch(
+                    entities=entities,
+                    url=args.url,
+                    token=token,
+                    dry_run=False,
+                    skip_existing=args.skip_existing,
+                    filter_platform=args.filter_type,
+                    filter_location=args.filter_location,
+                    area_map=area_map,
+                    websocket=websocket,
+                    next_id=next_id,
+                )
+            finally:
+                await websocket.close()
+                print("Connection closed.")
+        else:
+            if args.skip_rooms and locations:
+                print("\nRoom/area creation skipped (--skip-rooms).")
+            summary = await create_entities_batch(
                 entities=entities,
                 url=args.url,
                 token=token,
@@ -1279,8 +1660,9 @@ def main():
                 skip_existing=args.skip_existing,
                 filter_platform=args.filter_type,
                 filter_location=args.filter_location,
+                area_map={},
             )
-        )
+
         print(
             f"\nDone: {summary['created']} created, "
             f"{summary['skipped']} skipped, "
@@ -1289,4 +1671,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

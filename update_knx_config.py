@@ -1,6 +1,7 @@
 """KNX Entity Creator — CLI for creating/deleting KNX entities in Home Assistant
 via the KNX integration's WebSocket API.
 """
+
 import argparse
 import asyncio
 import json
@@ -18,16 +19,29 @@ KNX_WEBSOCKET_COMMANDS = {
     "get_entities_by_group": "knx/get_entities_by_group",
     "validate_entity": "knx/validate_entity",
     "get_schema": "knx/get_schema",
+    "floor_list": "config/floor_registry/list",
+    "floor_create": "config/floor_registry/create",
+    "area_list": "config/area_registry/list",
+    "area_create": "config/area_registry/create",
+    "entity_update": "config/entity_registry/update",
+    "entity_remove": "config/entity_registry/remove",
 }
 
 CLIMATE_CONTROLLER_MODES = (
-    "off", "heat", "cool", "heat_cool", "auto", "dry", "fan_only",
+    "off",
+    "heat",
+    "cool",
+    "heat_cool",
+    "auto",
+    "dry",
+    "fan_only",
 )
 
 
 # ---------------------------------------------------------------------------
 # WebSocket layer
 # ---------------------------------------------------------------------------
+
 
 async def send_ws_message(websocket, msg_id, msg_type, payload=None):
     """Send a WebSocket message and return the parsed JSON response."""
@@ -47,10 +61,14 @@ async def connect_and_authenticate(url, token):
         if auth_data.get("type") != "auth_required":
             raise ConnectionError(f"Unexpected initial message: {auth_data}")
 
-        await websocket.send(json.dumps({
-            "type": "auth",
-            "access_token": token,
-        }))
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "auth",
+                    "access_token": token,
+                }
+            )
+        )
 
         result_data = json.loads(await websocket.recv())
         if result_data.get("type") != "auth_ok":
@@ -71,7 +89,9 @@ async def get_knx_base_data(websocket, msg_id):
 
 async def get_entity_schema(websocket, msg_id, platform):
     return await send_ws_message(
-        websocket, msg_id, KNX_WEBSOCKET_COMMANDS["get_schema"],
+        websocket,
+        msg_id,
+        KNX_WEBSOCKET_COMMANDS["get_schema"],
         {"platform": platform},
     )
 
@@ -97,21 +117,121 @@ async def get_entities_by_group(websocket, msg_id):
 
 async def validate_entity(websocket, msg_id, platform, data):
     return await send_ws_message(
-        websocket, msg_id, KNX_WEBSOCKET_COMMANDS["validate_entity"],
+        websocket,
+        msg_id,
+        KNX_WEBSOCKET_COMMANDS["validate_entity"],
         {"platform": platform, "data": data},
     )
 
 
 async def create_entity(websocket, msg_id, platform, data):
     return await send_ws_message(
-        websocket, msg_id, KNX_WEBSOCKET_COMMANDS["create_entity"],
+        websocket,
+        msg_id,
+        KNX_WEBSOCKET_COMMANDS["create_entity"],
         {"platform": platform, "data": data},
     )
 
 
 async def delete_entity(websocket, msg_id, entity_id):
     return await send_ws_message(
-        websocket, msg_id, KNX_WEBSOCKET_COMMANDS["delete_entity"],
+        websocket,
+        msg_id,
+        KNX_WEBSOCKET_COMMANDS["delete_entity"],
+        {"entity_id": entity_id},
+    )
+
+
+async def list_floors(websocket, msg_id):
+    """Fetch all floors from Home Assistant.
+
+    Returns the ``config/floor_registry/list`` response, whose ``result`` is a
+    list of floor objects with ``floor_id``, ``name``, ``level``, etc.
+    """
+    return await send_ws_message(
+        websocket, msg_id, KNX_WEBSOCKET_COMMANDS["floor_list"]
+    )
+
+
+async def create_floor(websocket, msg_id, name, level=None):
+    """Create a floor in Home Assistant.
+
+    Args:
+        name: Floor display name (must be unique).
+        level: Optional integer floor level (higher = higher floor;
+            negative for basements).
+
+    Returns the ``config/floor_registry/create`` response. On success the
+    ``result`` contains the created floor object including its ``floor_id``.
+    """
+    payload = {"name": name}
+    if level is not None:
+        payload["level"] = level
+    return await send_ws_message(
+        websocket, msg_id, KNX_WEBSOCKET_COMMANDS["floor_create"], payload
+    )
+
+
+async def list_areas(websocket, msg_id):
+    """Fetch all areas from Home Assistant.
+
+    Returns the ``config/area_registry/list`` response, whose ``result`` is a
+    list of area objects with ``area_id``, ``name``, ``floor_id``, etc.
+    """
+    return await send_ws_message(websocket, msg_id, KNX_WEBSOCKET_COMMANDS["area_list"])
+
+
+async def create_area(websocket, msg_id, name, floor_id=None):
+    """Create an area in Home Assistant, optionally assigned to a floor.
+
+    Args:
+        name: Area display name.
+        floor_id: Optional floor ID to assign this area to.
+
+    Returns the ``config/area_registry/create`` response. On success the
+    ``result`` contains the created area object including its ``area_id``.
+    """
+    payload = {"name": name}
+    if floor_id:
+        payload["floor_id"] = floor_id
+    return await send_ws_message(
+        websocket, msg_id, KNX_WEBSOCKET_COMMANDS["area_create"], payload
+    )
+
+
+async def update_entity_area(websocket, msg_id, entity_id, area_id):
+    """Assign an entity to an area via the entity registry.
+
+    Uses ``config/entity_registry/update`` to set the ``area_id`` on an
+    existing entity without changing other properties.
+
+    Args:
+        entity_id: The entity to update (e.g. ``"light.kitchen_light"``).
+        area_id: The area ID to assign the entity to.
+    """
+    return await send_ws_message(
+        websocket,
+        msg_id,
+        KNX_WEBSOCKET_COMMANDS["entity_update"],
+        {"entity_id": entity_id, "area_id": area_id},
+    )
+
+
+async def remove_entity_registry_entry(websocket, msg_id, entity_id):
+    """Remove an entity from the Home Assistant entity registry.
+
+    This is the counterpart to ``knx/delete_entity`` which only removes
+    the entity from the KNX config store.  An entity must be removed from
+    BOTH stores to avoid orphaned registry entries that block future
+    entity ID reuse.
+
+    Args:
+        entity_id: The entity to remove (e.g. ``"light.kitchen_light"``).
+    """
+    return await send_ws_message(
+        websocket,
+        msg_id,
+        KNX_WEBSOCKET_COMMANDS["entity_remove"],
         {"entity_id": entity_id},
     )
 
@@ -119,6 +239,7 @@ async def delete_entity(websocket, msg_id, entity_id):
 # ---------------------------------------------------------------------------
 # Config builders
 # ---------------------------------------------------------------------------
+
 
 def get_light_config(
     name,
@@ -309,6 +430,7 @@ def get_cover_config(
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def _build_arg_parser():
     parser = argparse.ArgumentParser(
         description="KNX Entity Creator via Home Assistant WebSocket API.",
@@ -322,7 +444,7 @@ def _build_arg_parser():
         "--token",
         default=None,
         help="Long-lived access token. If omitted, falls back to the "
-             "HA_TOKEN environment variable.",
+        "HA_TOKEN environment variable.",
     )
     parser.add_argument(
         "--entity-type",
@@ -333,12 +455,18 @@ def _build_arg_parser():
     parser.add_argument(
         "--address",
         help="Primary KNX group address. Meaning depends on --entity-type: "
-             "switch/light = on/off write; binary_sensor = state; "
-             "cover = up/down write.",
+        "switch/light = on/off write; binary_sensor = state; "
+        "cover = up/down write.",
     )
-    parser.add_argument("--state-address", help="State feedback address (light/switch).")
-    parser.add_argument("--brightness-address", help="Brightness write address (light).")
-    parser.add_argument("--brightness-state-address", help="Brightness state address (light).")
+    parser.add_argument(
+        "--state-address", help="State feedback address (light/switch)."
+    )
+    parser.add_argument(
+        "--brightness-address", help="Brightness write address (light)."
+    )
+    parser.add_argument(
+        "--brightness-state-address", help="Brightness state address (light)."
+    )
     parser.add_argument("--color-address", help="Color write address (light).")
     parser.add_argument("--color-state-address", help="Color state address (light).")
     parser.add_argument(
@@ -347,11 +475,17 @@ def _build_arg_parser():
     )
     parser.add_argument("--invert", action="store_true", help="Invert switch state.")
     parser.add_argument("--device-class", help="Device class (binary_sensor).")
-    parser.add_argument("--temperature-state", help="Current temperature state (climate).")
+    parser.add_argument(
+        "--temperature-state", help="Current temperature state (climate)."
+    )
     parser.add_argument("--setpoint-write", help="Setpoint write address (climate).")
     parser.add_argument("--setpoint-state", help="Setpoint state address (climate).")
-    parser.add_argument("--operation-mode-write", help="Operation mode write (climate).")
-    parser.add_argument("--operation-mode-state", help="Operation mode state (climate).")
+    parser.add_argument(
+        "--operation-mode-write", help="Operation mode write (climate)."
+    )
+    parser.add_argument(
+        "--operation-mode-state", help="Operation mode state (climate)."
+    )
     parser.add_argument("--on-off-write", help="On/off write address (climate).")
     parser.add_argument("--on-off-state", help="On/off state address (climate).")
     parser.add_argument(
@@ -365,18 +499,20 @@ def _build_arg_parser():
     parser.add_argument("--position-state", help="Position state address (cover).")
     parser.add_argument(
         "--travelling-time-up",
-        type=int, default=60,
+        type=int,
+        default=60,
         help="Travelling time up in seconds (cover, default: 60).",
     )
     parser.add_argument(
         "--travelling-time-down",
-        type=int, default=60,
+        type=int,
+        default=60,
         help="Travelling time down in seconds (cover, default: 60).",
     )
     parser.add_argument(
         "--delete",
         help="Delete entity by entity_id (e.g., light.test_light). "
-             "Mutually exclusive with creation flags.",
+        "Mutually exclusive with creation flags.",
     )
     return parser
 
@@ -432,10 +568,12 @@ def _build_payload(args):
         )
     if et == "climate":
         missing = [
-            flag for flag, val in (
+            flag
+            for flag, val in (
                 ("--temperature-state", args.temperature_state),
                 ("--setpoint-write", args.setpoint_write),
-            ) if not val
+            )
+            if not val
         ]
         if missing:
             sys.exit(f"error: {', '.join(missing)} required for climate.")
@@ -470,9 +608,26 @@ async def _run_delete(args, token):
     print(f"Connecting to {args.url}...")
     websocket = await connect_and_authenticate(args.url, token)
     try:
-        print(f"\n--- Deleting entity: {args.delete} ---")
-        result = await delete_entity(websocket, 1, args.delete)
-        print(f"Deletion result: {json.dumps(result, indent=2)}")
+        msg_id = 1
+        entity_id = args.delete
+
+        # 1. Remove from KNX config store
+        print(f"\n--- Removing from KNX config: {entity_id} ---")
+        knx_result = await delete_entity(websocket, msg_id, entity_id)
+        msg_id += 1
+        knx_ok = knx_result.get("success", False)
+        print(f"  KNX config: {'removed' if knx_ok else 'not found or failed'}")
+
+        # 2. Remove from entity registry (prevents orphaned entries)
+        print(f"\n--- Removing from entity registry: {entity_id} ---")
+        reg_result = await remove_entity_registry_entry(websocket, msg_id, entity_id)
+        reg_ok = reg_result.get("success", False)
+        print(f"  Entity registry: {'removed' if reg_ok else 'not found or failed'}")
+
+        if knx_ok or reg_ok:
+            print(f"\nEntity {entity_id!r} removed from HA.")
+        else:
+            print(f"\nEntity {entity_id!r} not found in either store.")
     finally:
         await websocket.close()
         print("Connection closed.")

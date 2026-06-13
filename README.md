@@ -137,6 +137,27 @@ python3 parse_knx_project.py \
   --create \
   --filter-type light \
   --filter-location "Living Room"
+
+# Create entities AND HA areas/floors from project locations (default)
+python3 parse_knx_project.py \
+  --project project.knxproj \
+  --password "ets-password" \
+  --create \
+  --skip-existing
+
+# Create all rooms from the project, even empty ones
+python3 parse_knx_project.py \
+  --project project.knxproj \
+  --password "ets-password" \
+  --create \
+  --create-all-rooms
+
+# Skip room/area creation entirely
+python3 parse_knx_project.py \
+  --project project.knxproj \
+  --password "ets-password" \
+  --create \
+  --skip-rooms
 ```
 
 ### How it works
@@ -151,6 +172,11 @@ python3 parse_knx_project.py \
    light, FT-8 = heating, FT-10 = switchable socket).
 4. **Create** entities via `update_knx_config`'s WebSocket API — validate,
    then create, skipping existing entities when requested.
+5. **Create floors and areas** from the project's location tree (Buildings →
+   Floors → Rooms).  By default only rooms that contain at least one KNX
+   function are created; use ``--create-all-rooms`` to create every room or
+   ``--skip-rooms`` to disable this behaviour entirely.  Successfully created
+   entities are automatically assigned to their corresponding HA area.
 
 ### Entity type mapping
 
@@ -184,7 +210,9 @@ python3 parse_knx_project.py \
 | `--output-json` | Write extracted entity configs to a JSON file |
 | `--no-meta` | Omit `_meta` fields from JSON output |
 | `--filter-type` | Only process `light`, `switch`, `binary_sensor`, or `climate`. (`cover` is accepted but the parser does not produce covers yet — see WIP note above.) |
-| `--filter-location` | Only process entities in a given room/location |
+| `--filter-location` | Only process entities in a given room/location. When ``--create`` is used, rooms and floors are always created before entity filtering is applied |
+| `--skip-rooms` | Do not create HA areas/floors from project locations, and do not assign entities to areas |
+| `--create-all-rooms` | Create HA areas/floors for ALL rooms found in the project, even those without any mapped functions |
 | `--verbose` / `-v` | Verbose output with entity details |
 
 ## CLI Reference
