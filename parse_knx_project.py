@@ -101,162 +101,6 @@ def _clean_entity_name(raw: str) -> str:
     return name
 
 
-def _classify_com_object(co: dict) -> Dict[str, Any]:
-    """Classify a single com object by its DPTs and flags only.
-
-    No manufacturer-specific names, no language-specific text.
-    """
-    flags = co.get("flags", {})
-    write = flags.get("write", False)
-    transmit = flags.get("transmit", False)
-    read = flags.get("read", False)
-    size = co.get("object_size", "")
-
-    dpt_mains = {d.get("main") for d in co.get("dpts", []) if d.get("main")}
-
-    return {
-        "dpt_mains": dpt_mains,
-        "size": size,
-        "is_pure_write": write and not transmit and not read,
-        "is_write_only": write and not transmit,
-        "is_transmit_only": transmit and not write,
-        "is_write_transmit": write and transmit,
-        "is_write_read": write and read and not transmit,
-        "has_dpt1": 1 in dpt_mains,
-        "has_dpt9": 9 in dpt_mains,
-        "has_dpt5": 5 in dpt_mains,
-        "has_dpt3": 3 in dpt_mains,
-    }
-
-
-def _classify_device(dev: dict, com_objects: dict) -> Dict[str, Any]:
-    """Classify a device by analyzing ALL its com objects' DPTs and flags.
-
-    A device can be multiple things at once (e.g., a RailQUAD has
-    temperature probes AND thermostat logic AND binary inputs).
-    We classify by what the device DOES:
-      - pure_actuator: has DPT 1 write-only (accepts bus commands)
-      - lighting_gateway: has DPT 5 or DPT 3
-      - sensor_input: DPT 1 transmit (originates sensor readings),
-        NOT write-only DPT 1
-      - thermostat_controller: has DPT 9 AND write-capable DPT 1
-        (can command something), not just DPT 9 read-only
-    """
-    co_ids = dev.get("communication_object_ids", [])
-    cos = []
-    for co_id in co_ids:
-        co = com_objects.get(co_id)
-        if co:
-            cos.append(_classify_com_object(co))
-
-    if not cos:
-        return {
-            "has_any_dpt9": False,
-            "has_any_dpt5": False,
-            "has_any_dpt3": False,
-            "has_write_only_dpt1": False,
-            "has_pure_write_dpt1": False,
-            "has_transmit_dpt1": False,
-            "is_pure_actuator": False,
-            "is_lighting_gateway": False,
-            "is_sensor_input": False,
-            "is_thermostat_controller": False,
-        }
-
-    has_any_dpt9 = any(c["has_dpt9"] for c in cos)
-    has_any_dpt5 = any(c["has_dpt5"] for c in cos)
-    has_any_dpt3 = any(c["has_dpt3"] for c in cos)
-    has_write_only_dpt1 = any(c["has_dpt1"] and c["is_write_only"] for c in cos)
-    has_pure_write_dpt1 = any(c["has_dpt1"] and c["is_pure_write"] for c in cos)
-    has_transmit_dpt1 = any(c["has_dpt1"] and c["is_transmit_only"] for c in cos)
-    has_write_transmit_dpt1 = any(c["has_dpt1"] and c["is_write_transmit"] for c in cos)
-    has_write_read_dpt1 = any(c["has_dpt1"] and c["is_write_read"] for c in cos)
-
-    # Pure actuator: accepts DPT 1 write-only commands
-    is_pure_actuator = has_pure_write_dpt1
-
-    # Lighting gateway: has DPT 5 (absolute brightness) or DPT 3 (dimming)
-    is_lighting_gateway = has_any_dpt5 or has_any_dpt3
-
-    # Sensor input: originates DPT 1 sensor readings (transmit or WTR),
-    # but does NOT accept write-only DPT 1 commands
-    is_sensor_input = (
-        has_transmit_dpt1 or has_write_transmit_dpt1
-    ) and not has_pure_write_dpt1
-
-    # Thermostat controller: has DPT 9 AND can issue DPT 1 commands
-    # (write-only, write+transmit, or write+read DPT 1 on the same device).
-    # A device with DPT 9 probes and WTR DPT 1 sensors only is NOT a
-    # thermostat controller — it's a sensor input.
-    is_thermostat_controller = has_any_dpt9 and (
-        has_pure_write_dpt1 or has_write_transmit_dpt1 or has_write_read_dpt1
-    )
-
-    return {
-        "has_any_dpt9": has_any_dpt9,
-        "has_any_dpt5": has_any_dpt5,
-        "has_any_dpt3": has_any_dpt3,
-        "has_write_only_dpt1": has_write_only_dpt1,
-        "has_pure_write_dpt1": has_pure_write_dpt1,
-        "has_transmit_dpt1": has_transmit_dpt1,
-        "is_pure_actuator": is_pure_actuator,
-        "is_lighting_gateway": is_lighting_gateway,
-        "is_sensor_input": is_sensor_input,
-        "is_thermostat_controller": is_thermostat_controller,
-    }
-
-
-def _classify_ga(ga_data: dict, com_objects: dict, devices: dict) -> Dict[str, Any]:
-    """Classify a GA by its DPT, com-object flags, and device role(s).
-
-    Uses only KNX-level data. No manufacturer names, no language text.
-    """
-    dpt = ga_data.get("dpt") or {}
-    co_ids = ga_data.get("communication_object_ids", [])
-    cos = []
-    for co_id in co_ids:
-        co = com_objects.get(co_id)
-        if co:
-            cos.append(_classify_com_object(co))
-
-    result = {
-        "dpt_main": dpt.get("main"),
-        "dpt_sub": dpt.get("sub"),
-        "has_write": False,
-        "has_transmit": False,
-        "is_pure_actuator": False,
-        "is_lighting_gateway": False,
-        "is_sensor_input": False,
-        "is_thermostat_controller": False,
-        "com_count": len(cos),
-    }
-
-    for co in cos:
-        if co["is_write_only"] or co["is_write_transmit"] or co["is_write_read"]:
-            result["has_write"] = True
-        if co["is_transmit_only"]:
-            result["has_transmit"] = True
-
-    # Device-level classification — aggregate across all linked devices
-    for co_id in co_ids:
-        co = com_objects.get(co_id, {})
-        dev_addr = co.get("device_address", "")
-        dev = devices.get(dev_addr, {})
-        if not dev:
-            continue
-        drole = _classify_device(dev, com_objects)
-        if drole["is_pure_actuator"]:
-            result["is_pure_actuator"] = True
-        if drole["is_lighting_gateway"]:
-            result["is_lighting_gateway"] = True
-        if drole["is_sensor_input"]:
-            result["is_sensor_input"] = True
-        if drole["is_thermostat_controller"]:
-            result["is_thermostat_controller"] = True
-
-    return result
-
-
 def _extract_from_functions(
     project: dict,
     skipped: Optional[List[Dict[str, str]]] = None,
@@ -341,191 +185,181 @@ def _extract_from_functions(
     return entities
 
 
-def _switch_role(cls: Dict[str, Any]) -> Optional[str]:
-    """Classify a DPT-1 GA as a switch 'write' or 'state' from its flags."""
-    if cls["has_write"] and not cls["has_transmit"]:
-        return "write"
-    if cls["has_transmit"] and not cls["has_write"]:
-        return "state"
-    if cls["has_write"]:
-        return "write"
-    if cls["has_transmit"]:
-        return "state"
-    return None
+def _status_name_token(name: str) -> str:
+    """Normalise a com-object identifier for command<->status matching.
 
-
-def _actuator_grouping(
-    ga: dict, com_objects: dict
-) -> Tuple[Optional[tuple], Optional[int], int]:
-    """Return ``(channel_key, order, num_devices)`` for a DPT-1 actuator GA.
-
-    Pairing of a switch-write GA with its status-feedback GA is driven by the
-    actuator's channel structure rather than by GA-address adjacency:
-
-    - ``channel_key`` groups GAs that belong to the same actuator channel. It
-      is ``(device, channel)`` when ETS exposes channel info, otherwise it
-      falls back to ``(device,)`` (group by device).
-    - ``order`` is the communication-object number — the device's own channel
-      layout order — used to pair the n-th write with the n-th status object.
-    - ``num_devices`` is how many distinct devices the GA's DPT-1 objects touch;
-      ``> 1`` marks a central/group command (not a single channel), which is
-      left to the adjacency fallback instead.
+    The status object's product identifier is the command's with a status
+    marker added, e.g. ``"A-G2 Schalten"`` (command) vs ``"A-G2 Status
+    Schalten"`` (status). Removing the marker and collapsing whitespace makes
+    the two equal, so a command can be paired to *its own* status even when a
+    multiplexing gateway puts many groups on one ETS channel.
     """
-    dev_to_num: Dict[str, int] = {}
-    channels: set = set()
-    for co_id in ga.get("communication_object_ids", []):
-        co = com_objects.get(co_id, {})
-        cc = _classify_com_object(co)
-        if not cc["has_dpt1"]:
-            continue
-        dev = co.get("device_address") or ""
-        if not dev:
-            continue
-        num = co.get("number")
-        if isinstance(num, int):
-            dev_to_num[dev] = min(dev_to_num.get(dev, num), num)
-        else:
-            dev_to_num.setdefault(dev, 0)
-        chan = co.get("channel")
-        if chan:
-            channels.add((dev, chan))
-
-    if not dev_to_num:
-        return None, None, 0
-
-    primary_dev = min(dev_to_num, key=lambda d: dev_to_num[d])
-    order = dev_to_num[primary_dev]
-    chan_key = next((c for c in channels if c[0] == primary_dev), None)
-    key = chan_key if chan_key is not None else (primary_dev,)
-    return key, order, len(dev_to_num)
+    stripped = re.sub(r"(?i)\b(status|fb|feedback|r[uü]ckmeldung)\b", " ", name or "")
+    return re.sub(r"\s+", " ", stripped).strip().lower()
 
 
 def _extract_unmapped(
     project: dict,
     mapped_addresses: set,
 ) -> List[Dict[str, Any]]:
-    """Extract entities from GAs not covered by any function.
+    """Deterministically extract entities from GAs not covered by any function.
 
-    Uses DPT + com-object flags + device type (not naming conventions).
+    OPT-IN fallback (enabled by ``--include-unmapped``). It uses the same
+    actuator-linkage model as the function builders — never address adjacency
+    or user GA labels — so it only emits entities that follow from the bus
+    topology and the manufacturer's product-database object identifiers.
+
+    Devices are first classified by the objects they own across unmapped GAs:
+
+    - *sender* — owns a Write+Transmit object (push button, scene logic,
+      visualisation gateway): never a load actuator;
+    - *cover* — owns a DPT-1.008 command (a blind drive): its DPT-1 GAs are
+      sun-protection / drive-status, not switches;
+    - *actuator* — owns a DPT-1.001 command (Write, not Transmit): a load
+      driver (relay, DALI gateway).
+
+    Switches: a GA with exactly one DPT-1.001 command object from a single
+    non-sender, non-cover device is a single load. (A GA carrying several such
+    objects is a central/group command — "all kitchen lights" — and is left
+    out.) Its status is the same device's Transmit-not-Write DPT-1.001/1.011
+    object whose product identifier matches by :func:`_status_name_token`;
+    failing that, the lone status object on the same channel.
+
+    Binary sensors: a pure-source DPT-1 GA (a Transmit-not-Write object and no
+    write object at all) whose source device is not an actuator or cover —
+    i.e. a field sensor (motion/contact), not an actuator's own status feedback.
     """
     group_addresses = project.get("group_addresses", {})
     com_objects = project.get("communication_objects", {})
-    devices = project.get("devices", {})
-    entities = []
-    consumed = set()
+    entities: List[Dict[str, Any]] = []
 
-    def _emit_switch(name: str, write_addr: str, state_addr: Optional[str]) -> None:
-        entity_data = get_switch_config(
-            name=name, address=write_addr, state_address=state_addr
-        )
+    def _emit(entity_data: dict, platform: str, name: str, usage: str) -> None:
         entity_data["_meta"] = {
-            "platform": "switch",
+            "platform": platform,
             "function_id": None,
             "function_type": None,
             "function_name": name,
-            "usage_text": "unmapped relay channel",
+            "usage_text": usage,
             "space": "",
             "space_id": "",
         }
         entities.append(entity_data)
 
-    # --- Step 1: Pair unmapped relay write + status-feedback by actuator channel ---
-    # Group each single-device DPT-1 actuator GA by its (device, channel); pair
-    # the n-th write object with the n-th status object in channel-layout order.
-    # GAs that span multiple devices (central/group commands) or expose no
-    # device info fall through to the address-adjacency heuristic below.
-    channel_groups: Dict[tuple, Dict[str, List[tuple]]] = defaultdict(
-        lambda: {"write": [], "state": []}
-    )
-    adjacency_fallback: List[Tuple[str, dict]] = []
-
+    # --- Classify devices by the objects they own across unmapped GAs. ---
+    sender_devices: set = set()
+    cover_devices: set = set()
+    actuator_devices: set = set()
     for addr, ga in group_addresses.items():
         if addr in mapped_addresses:
             continue
-        cls = _classify_ga(ga, com_objects, devices)
-        if cls["dpt_main"] != 1 or not cls["is_pure_actuator"]:
-            continue
-        role = _switch_role(cls)
-        if role is None:
-            continue
-        key, order, num_devices = _actuator_grouping(ga, com_objects)
-        if key is None or num_devices != 1:
-            # No device info, or a central command across many devices.
-            adjacency_fallback.append((addr, ga))
-            continue
-        channel_groups[key][role].append((order if order is not None else 0, addr, ga))
-
-    for group in channel_groups.values():
-        writes = sorted(group["write"])
-        states = sorted(group["state"])
-        for idx, (_, w_addr, w_ga) in enumerate(writes):
-            s_addr = states[idx][1] if idx < len(states) else None
-            _emit_switch(_clean_entity_name(w_ga["name"]), w_addr, s_addr)
-            consumed.add(w_addr)
-            if idx < len(states):
-                consumed.add(states[idx][1])
-
-    # --- Step 1b: Address-adjacency fallback (only when channel info is absent) ---
-    adjacency_fallback.sort(key=lambda x: x[1].get("raw_address", 0))
-
-    i = 0
-    while i < len(adjacency_fallback) - 1:
-        addr_a, ga_a = adjacency_fallback[i]
-        addr_b, ga_b = adjacency_fallback[i + 1]
-        if addr_a in consumed:
-            i += 1
-            continue
-        raw_a = ga_a.get("raw_address", 0)
-        raw_b = ga_b.get("raw_address", 0)
-
-        if raw_b - raw_a == 1 and addr_b not in consumed:
-            cls_a = _classify_ga(ga_a, com_objects, devices)
-            cls_b = _classify_ga(ga_b, com_objects, devices)
-
-            a_is_write = cls_a["has_write"] and not cls_a["has_transmit"]
-            a_is_state = cls_a["has_transmit"] and not cls_a["has_write"]
-            b_is_write = cls_b["has_write"] and not cls_b["has_transmit"]
-            b_is_state = cls_b["has_transmit"] and not cls_b["has_write"]
-
-            if a_is_write and b_is_state:
-                switch_write, switch_state = addr_a, addr_b
-            elif b_is_write and a_is_state:
-                switch_write, switch_state = addr_b, addr_a
-            elif a_is_write and not b_is_write:
-                switch_write, switch_state = addr_a, addr_b
-            elif b_is_write and not a_is_write:
-                switch_write, switch_state = addr_b, addr_a
-            else:
-                i += 1
+        dpt = ga.get("dpt") or {}
+        main, sub = dpt.get("main"), dpt.get("sub")
+        for co_id in ga.get("communication_object_ids", []):
+            co = com_objects.get(co_id, {})
+            dev = co.get("device_address", "")
+            if not dev:
                 continue
+            flags = co.get("flags", {})
+            write = flags.get("write", False)
+            transmit = flags.get("transmit", False)
+            if write and transmit:
+                sender_devices.add(dev)
+            elif write and not transmit and main == 1 and sub == 8:
+                cover_devices.add(dev)
+            elif write and not transmit and main == 1 and sub == 1:
+                actuator_devices.add(dev)
 
-            _emit_switch(_clean_entity_name(ga_a["name"]), switch_write, switch_state)
-            consumed.update([addr_a, addr_b])
-            i += 2
+    # --- Build a per-device index of status objects for command<->status pairing. ---
+    # device -> list of (name_token, channel, addr)
+    status_index: Dict[str, list] = defaultdict(list)
+    for addr, ga in group_addresses.items():
+        if addr in mapped_addresses:
+            continue
+        dpt = ga.get("dpt") or {}
+        if dpt.get("main") != 1 or dpt.get("sub") not in (1, 11):
+            continue
+        for co_id in ga.get("communication_object_ids", []):
+            co = com_objects.get(co_id, {})
+            dev = co.get("device_address", "")
+            if not dev or dev in sender_devices:
+                continue
+            flags = co.get("flags", {})
+            if flags.get("transmit") and not flags.get("write"):
+                status_index[dev].append(
+                    (_status_name_token(co.get("name", "")), co.get("channel"), addr)
+                )
+
+    # --- Switches: single-load DPT-1.001 commands, status paired by identifier. ---
+    consumed: set = set()
+    for addr, ga in group_addresses.items():
+        if addr in mapped_addresses:
+            continue
+        dpt = ga.get("dpt") or {}
+        if dpt.get("main") != 1 or dpt.get("sub") != 1:
+            continue
+
+        command_objs = []
+        for co_id in ga.get("communication_object_ids", []):
+            co = com_objects.get(co_id, {})
+            dev = co.get("device_address", "")
+            if not dev or dev in sender_devices or dev in cover_devices:
+                continue
+            flags = co.get("flags", {})
+            if flags.get("write") and not flags.get("transmit"):
+                command_objs.append(co)
+
+        # Exactly one command object => a single load (not a group command).
+        if len(command_objs) != 1:
+            continue
+        co = command_objs[0]
+        dev = co.get("device_address", "")
+        token = _status_name_token(co.get("name", ""))
+        channel = co.get("channel")
+
+        candidates = status_index.get(dev, [])
+        token_match = [s_addr for tok, _ch, s_addr in candidates if tok and tok == token]
+        channel_match = [s_addr for _tok, ch, s_addr in candidates if ch == channel]
+        if token_match:
+            state_addr = token_match[0]
+        elif len(channel_match) == 1:
+            state_addr = channel_match[0]
         else:
-            i += 1
+            state_addr = None
 
-    # --- Step 2: Binary sensor inputs ---
+        name = ga.get("name", "")
+        entity_data = get_switch_config(
+            name=_clean_entity_name(name) or f"Switch {addr}",
+            address=addr,
+            state_address=state_addr,
+        )
+        _emit(entity_data, "switch", name, "unmapped relay channel")
+        consumed.add(addr)
+        if state_addr:
+            consumed.add(state_addr)
+
+    # --- Binary sensors: pure-source DPT-1 GAs from non-actuator field devices. ---
     for addr, ga in group_addresses.items():
         if addr in mapped_addresses or addr in consumed:
             continue
-        cls = _classify_ga(ga, com_objects, devices)
-        if cls["dpt_main"] != 1:
+        if (ga.get("dpt") or {}).get("main") != 1:
             continue
-        if cls["is_sensor_input"] and not cls["is_pure_actuator"]:
-            name = _clean_entity_name(ga["name"]) or f"Binary {addr}"
-            entity_data = get_binary_sensor_config(name=name, state_address=addr)
-            entity_data["_meta"] = {
-                "platform": "binary_sensor",
-                "function_id": None,
-                "function_type": None,
-                "function_name": ga["name"],
-                "usage_text": "binary sensor input",
-                "space": "",
-                "space_id": "",
-            }
-            entities.append(entity_data)
-            consumed.add(addr)
+        source_devices = set()
+        has_write = False
+        for co_id in ga.get("communication_object_ids", []):
+            co = com_objects.get(co_id, {})
+            flags = co.get("flags", {})
+            if flags.get("write"):
+                has_write = True
+            if flags.get("transmit") and not flags.get("write"):
+                source_devices.add(co.get("device_address", ""))
+        if has_write or not source_devices:
+            continue
+        # A status fed by an actuator/cover is that load's feedback, not a sensor.
+        if source_devices & (actuator_devices | cover_devices):
+            continue
+        name = _clean_entity_name(ga.get("name", "")) or f"Binary {addr}"
+        entity_data = get_binary_sensor_config(name=name, state_address=addr)
+        _emit(entity_data, "binary_sensor", ga.get("name", ""), "binary sensor input")
 
     return entities
 
@@ -556,55 +390,129 @@ def _build_entity_for_platform(
     return None
 
 
-def _find_actuator(
-    gas: List[Tuple[str, dict]], com_objects: dict
-) -> str:
-    """Return the device address that binds the most com objects.
+def _co_direction(co: dict) -> Optional[str]:
+    """Classify a single com object's direction from its flags.
 
-    Across every GA in a function, the actuator (relay/dimmer/blind drive)
-    typically binds more com objects than the push buttons or sensors that
-    share those GAs, so "most com objects" is a reliable way to single it
-    out. Only its flags are then trusted to tell command from feedback.
-
-    On a tie the winner is whichever device was seen first (dict insertion
-    order); the GA order is deterministic so the result is stable per run,
-    but a genuine tie between two devices is otherwise arbitrary.
-    Returns "" when no com object carries a device address.
+    Returns ``"command"`` for a pure command sink (Write and not Transmit),
+    ``"feedback"`` for a pure feedback source (Transmit and not Write), or
+    ``None`` for a directionless object — one that is both Write and Transmit
+    (a visualisation/logic gateway, or a push-button send object) or neither.
     """
-    device_co_count: Dict[str, int] = {}
-    for _addr, ga in gas:
-        for co_id in ga.get("communication_object_ids", []):
-            co = com_objects.get(co_id, {})
-            dev_addr = co.get("device_address", "")
-            if dev_addr:
-                device_co_count[dev_addr] = device_co_count.get(dev_addr, 0) + 1
-    if not device_co_count:
-        return ""
-    return max(device_co_count, key=device_co_count.get)
-
-
-def _actuator_co_for_ga(
-    ga: dict, com_objects: dict, actuator_addr: str
-) -> Optional[dict]:
-    """Return the actuator's com object bound to this GA, or None.
-
-    When ``actuator_addr`` is empty (no device addresses found) nothing is
-    matched, so the caller skips the GA rather than matching device-less
-    com objects by accident.
-    """
-    if not actuator_addr:
-        return None
-    for co_id in ga.get("communication_object_ids", []):
-        co = com_objects.get(co_id)
-        if co and co.get("device_address", "") == actuator_addr:
-            return co
+    flags = co.get("flags", {})
+    write = flags.get("write", False)
+    transmit = flags.get("transmit", False)
+    if write and not transmit:
+        return "command"
+    if transmit and not write:
+        return "feedback"
     return None
 
 
-def _ga_write_transmit(actuator_co: dict) -> Tuple[bool, bool]:
-    """Return ``(write, transmit)`` flags for an actuator com object."""
-    flags = actuator_co.get("flags", {})
-    return flags.get("write", False), flags.get("transmit", False)
+def _select_actuator(gas: List[Tuple[str, dict]], com_objects: dict) -> str:
+    """Deterministically identify the load actuator from com-object linkage.
+
+    The actuator is the device that *receives* the function's commands and
+    *sends* its feedback, so across the function's group addresses it owns
+    ``command`` objects (Write, not Transmit) and ``feedback`` objects
+    (Transmit, not Write). This distinguishes it from:
+
+    - push buttons / sensors, which *transmit* commands (Write+Transmit) and
+      only sink status into their indicator LEDs;
+    - visualisation / logic gateways, whose objects are Read+Write+Transmit on
+      every GA and therefore directionless (:func:`_co_direction` → ``None``).
+
+    Devices are ranked by ``(#feedback objects, #command objects)`` — feedback
+    first, deliberately: a push button's indicator LEDs *receive* status, so
+    they look like command sinks and can out-count the real actuator's single
+    command input (see the indicator-LED two-GA case). Only the load
+    actuator is a *source* of the load's feedback, so the feedback count breaks
+    that tie correctly.
+
+    A device is disqualified outright if it owns any *sender* object
+    (Write+Transmit) on the function — that is the push-button / wall-switch /
+    visualisation signature (they transmit commands onto the bus). A real load
+    actuator's inputs are write-only and its outputs transmit-only; it never
+    transmits a command. Without this guard, a function whose real actuator is
+    not linked (e.g. a DALI ballast missing from the export) would fall back to
+    a push button whose only command-looking object is an indicator-LED status
+    sink, producing a switch address pointed at the feedback GA. A device must
+    also own at least one command object to qualify. Returns ``""`` when no
+    device qualifies — the caller then skips and reports the function.
+    """
+    commands: Dict[str, int] = {}
+    feedbacks: Dict[str, int] = {}
+    senders: Dict[str, int] = {}
+    for _addr, ga in gas:
+        for co_id in ga.get("communication_object_ids", []):
+            co = com_objects.get(co_id, {})
+            dev = co.get("device_address", "")
+            if not dev:
+                continue
+            flags = co.get("flags", {})
+            write = flags.get("write", False)
+            transmit = flags.get("transmit", False)
+            if write and transmit:
+                senders[dev] = senders.get(dev, 0) + 1
+            elif write:
+                commands[dev] = commands.get(dev, 0) + 1
+            elif transmit:
+                feedbacks[dev] = feedbacks.get(dev, 0) + 1
+    qualifying = [
+        dev
+        for dev, n in commands.items()
+        if n > 0 and senders.get(dev, 0) == 0
+    ]
+    if not qualifying:
+        return ""
+    return max(qualifying, key=lambda d: (feedbacks.get(d, 0), commands[d]))
+
+
+def _actuator_ga_dirs(
+    ga: dict, com_objects: dict, actuator: str
+) -> Tuple[bool, bool]:
+    """``(has_command, has_feedback)`` for the actuator's objects on this GA.
+
+    Both can be true at once: a multi-channel actuator may cross-link a foreign
+    channel's command onto another channel's feedback GA, and a value gateway
+    may echo its set-value back on the same GA. The pairing in
+    :func:`_pick_command_feedback` resolves which slot each GA fills, so this
+    reports the raw directions rather than forcing a single role. Other devices
+    on the GA (senders, visualisation gateways) are ignored.
+    """
+    has_command = has_feedback = False
+    if actuator:
+        for co_id in ga.get("communication_object_ids", []):
+            co = com_objects.get(co_id, {})
+            if co.get("device_address", "") != actuator:
+                continue
+            direction = _co_direction(co)
+            if direction == "command":
+                has_command = True
+            elif direction == "feedback":
+                has_feedback = True
+    return has_command, has_feedback
+
+
+def _pick_command_feedback(
+    bucket: List[Tuple[str, bool, bool]],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Pick ``(command, feedback)`` addresses from one DPT role bucket.
+
+    ``bucket`` items are ``(address, has_command, has_feedback)`` in GA order.
+    A GA that carries only one direction (pure command / pure feedback) is
+    preferred for its slot, so a cross-linked or echoed GA that carries both
+    never steals a slot from the unambiguous GA. The feedback address must
+    differ from the chosen command address, so one GA can never fill both.
+    """
+    pure_command = [a for a, c, f in bucket if c and not f]
+    any_command = [a for a, c, f in bucket if c]
+    command = (pure_command or any_command or [None])[0]
+
+    pure_feedback = [a for a, c, f in bucket if f and not c and a != command]
+    any_feedback = [a for a, c, f in bucket if f and a != command]
+    feedback = (pure_feedback or any_feedback or [None])[0]
+
+    return command, feedback
 
 
 def _build_light(
@@ -614,50 +522,35 @@ def _build_light(
     function_type: str,
     devices: dict = None,
 ) -> Optional[Dict[str, Any]]:
-    """Build a light entity from a group of GAs using DPT + flags.
+    """Build a light entity from actuator-linkage roles per DPT.
 
-    Identifies the actuator device (the device with the most com objects
-    across all GAs in the function) and uses only its com object flags to
-    distinguish command (write-only) from feedback (transmit-only) GAs.
-    This avoids ambiguity from push buttons and sensors that share GAs.
+    The load actuator is identified from com-object linkage
+    (:func:`_select_actuator`); GAs are bucketed by DPT (switch = DPT 1,
+    brightness = DPT 5 absolute value) and each bucket's command/feedback pair
+    is resolved by :func:`_pick_command_feedback` from the actuator's own object
+    directions. DPT 3 (relative dim) and DPT 7.600 (colour temperature) are
+    intentionally ignored — HA needs only switch and brightness here.
     """
-    if devices is None:
-        devices = {}
+    actuator = _select_actuator(gas, com_objects)
 
-    actuator_addr = _find_actuator(gas, com_objects)
-
-    switch_write = None
-    switch_state = None
-    brightness_write = None
-    brightness_state = None
+    switch_bucket: List[Tuple[str, bool, bool]] = []
+    brightness_bucket: List[Tuple[str, bool, bool]] = []
 
     for addr, ga in gas:
-        dpt = ga.get("dpt") or {}
-        dpt_main = dpt.get("main")
-
-        actuator_co = _actuator_co_for_ga(ga, com_objects, actuator_addr)
-        if not actuator_co:
+        dpt_main = (ga.get("dpt") or {}).get("main")
+        if dpt_main not in (1, 5):
             continue
-
-        write, transmit = _ga_write_transmit(actuator_co)
-
+        has_command, has_feedback = _actuator_ga_dirs(ga, com_objects, actuator)
+        if not (has_command or has_feedback):
+            continue
+        entry = (addr, has_command, has_feedback)
         if dpt_main == 1:
-            if write and not transmit:
-                switch_write = addr
-            elif transmit and not write:
-                switch_state = addr
-            elif write:
-                # write+transmit — prefer as write (command)
-                if not switch_write:
-                    switch_write = addr
-        elif dpt_main == 5:
-            if write and not transmit:
-                brightness_write = addr
-            elif transmit and not write:
-                brightness_state = addr
-            elif write:
-                if not brightness_write:
-                    brightness_write = addr
+            switch_bucket.append(entry)
+        else:  # DPT 5 — absolute brightness value
+            brightness_bucket.append(entry)
+
+    switch_write, switch_state = _pick_command_feedback(switch_bucket)
+    brightness_write, brightness_state = _pick_command_feedback(brightness_bucket)
 
     if switch_write is None:
         return None
@@ -677,37 +570,24 @@ def _build_switch(
     com_objects: dict,
     devices: dict = None,
 ) -> Optional[Dict[str, Any]]:
-    """Build a switch entity from a group of GAs using DPT + flags.
+    """Build a switch entity from the DPT-1 GAs of a function.
 
-    Identifies the actuator device and uses only its com object flags to
-    distinguish command (write-only) from feedback (transmit-only) GAs.
+    Command and feedback are resolved from the load actuator's own object
+    directions (:func:`_select_actuator` + :func:`_actuator_ga_dirs` +
+    :func:`_pick_command_feedback`), so senders, visualisation gateways, and
+    foreign cross-linked channels sharing a GA do not confuse the assignment.
     """
-    if devices is None:
-        devices = {}
+    actuator = _select_actuator(gas, com_objects)
 
-    actuator_addr = _find_actuator(gas, com_objects)
-
-    switch_write = None
-    switch_state = None
-
+    bucket: List[Tuple[str, bool, bool]] = []
     for addr, ga in gas:
-        dpt = ga.get("dpt") or {}
-        if dpt.get("main") != 1:
+        if (ga.get("dpt") or {}).get("main") != 1:
             continue
+        has_command, has_feedback = _actuator_ga_dirs(ga, com_objects, actuator)
+        if has_command or has_feedback:
+            bucket.append((addr, has_command, has_feedback))
 
-        actuator_co = _actuator_co_for_ga(ga, com_objects, actuator_addr)
-        if not actuator_co:
-            continue
-
-        write, transmit = _ga_write_transmit(actuator_co)
-
-        if write and not transmit:
-            switch_write = addr
-        elif transmit and not write:
-            switch_state = addr
-        elif write:
-            if not switch_write:
-                switch_write = addr
+    switch_write, switch_state = _pick_command_feedback(bucket)
 
     if switch_write is None:
         return None
@@ -719,6 +599,34 @@ def _build_switch(
     )
 
 
+def _actuator_dpt9_objects(ga: dict, com_objects: dict, actuator: str):
+    """Yield ``(direction, sem)`` for the actuator's DPT-9.001 objects on a GA.
+
+    ``direction`` is from :func:`_co_direction`; ``sem`` is the lower-cased
+    concatenation of the object's structured identifier, function text and
+    display text. Only DPT 9.001 (temperature) objects are yielded, so
+    humidity (9.007) and CO2 (9.008) on the same function are never considered.
+    """
+    for co_id in ga.get("communication_object_ids", []):
+        co = com_objects.get(co_id, {})
+        if co.get("device_address", "") != actuator:
+            continue
+        dpts = co.get("dpts") or []
+        if not any(d.get("main") == 9 and d.get("sub") == 1 for d in dpts):
+            continue
+        sem = " ".join(
+            str(co.get(k, "") or "") for k in ("name", "function_text", "text")
+        ).lower()
+        yield _co_direction(co), sem
+
+
+# Keywords (in the controller's own object identifier / function text) that
+# pick the current-temperature feedback object, best first. The controller
+# exposes several DPT-9.001 feedback temperatures (effective/control, probe,
+# raw source); the effective/control temperature is what HA should display.
+_TEMP_CURRENT_KEYWORDS = ("effective", "actual", "current", "room", "operative")
+
+
 def _build_climate(
     name: str,
     gas: List[Tuple[str, dict]],
@@ -726,98 +634,60 @@ def _build_climate(
     group_addresses: dict,
     devices: dict = None,
 ) -> Optional[Dict[str, Any]]:
-    """Build a climate entity using DPT + flags + device roles only.
+    """Build a climate entity from the thermostat controller's linkage.
 
-    No manufacturer-specific com-object names. No language-dependent text.
+    The controller (room thermostat / heating channel) is identified from
+    com-object linkage (:func:`_select_actuator`). Temperature and setpoint are
+    both DPT 9.001 with identical flags, so they cannot be told apart by
+    direction alone — the controller's structured object identifier
+    (``name`` / ``function_text``, e.g. ``oTh[0].tempSetpoint`` vs
+    ``oTh[0].tempEffective``) is the deterministic discriminator. Only the
+    controller's own objects are inspected, so the visualisation gateway and
+    the wall RTC sharing the GAs are ignored.
 
-    Classification:
-      - DPT 9, transmit-only (no write) → temperature current (probe)
-      - DPT 9, write+read → setpoint (target temperature)
-      - DPT 1, linked to a pure-actuator device → control variable → SKIP
-      - DPT 1, linked only to thermostat-capable devices → on_off control
+    Mapping (all DPT 9.001, restricted to the controller):
+      - object identifier contains "setpoint", command  → setpoint write
+      - object identifier contains "setpoint", feedback  → setpoint state
+      - feedback, not setpoint, best temperature keyword → current temperature
+
+    DPT 5 control-variable outputs (to the valve), DPT 9.007/9.008
+    humidity/CO2, and the external-sensor *input* objects are all ignored.
     """
-    if devices is None:
-        devices = {}
-
-    temp_state = None
-    setpoint_write = None
-    on_off_write = None
-
-    for addr, ga in gas:
-        dpt = (ga.get("dpt") or {}).get("main")
-
-        if dpt == 9:
-            # Inspect com objects individually to find write-only (command)
-            # and transmit-only (feedback) flags, avoiding ambiguity when
-            # multiple devices share a GA.
-            write_only_co = None
-            transmit_only_co = None
-            write_transmit_co = None
-            for co_id in ga.get("communication_object_ids", []):
-                co = com_objects.get(co_id, {})
-                cc = _classify_com_object(co)
-                if not cc["has_dpt9"]:
-                    continue
-                if cc["is_write_only"] or cc["is_write_read"]:
-                    write_only_co = co_id
-                if cc["is_transmit_only"]:
-                    transmit_only_co = co_id
-                if cc["is_write_transmit"]:
-                    write_transmit_co = co_id
-
-            # A write+transmit object still has a write path, so fold it into
-            # the write side; otherwise such setpoints get silently dropped.
-            has_write_co = write_only_co or write_transmit_co
-
-            if transmit_only_co and not has_write_co:
-                # Pure transmit: temperature sensor probe value
-                temp_state = addr
-            elif has_write_co and not transmit_only_co:
-                # Write path only, no feedback: thermostat reading from sensor
-                if not temp_state:
-                    temp_state = addr
-            elif has_write_co:
-                # Both a write path and a transmit-only path exist: setpoint
-                setpoint_write = addr
-
-        elif dpt == 1:
-            # Determine if this GA goes to a pure actuator (control variable)
-            # or stays on a thermostat (on/off)
-            links_to_actuator = False
-            links_to_thermostat = False
-
-            for co_id in ga.get("communication_object_ids", []):
-                co = com_objects.get(co_id, {})
-                cc = _classify_com_object(co)
-                if not cc["has_dpt1"]:
-                    continue
-                dev_addr = co.get("device_address", "")
-                dev = devices.get(dev_addr, {})
-                drole = _classify_device(dev, com_objects)
-
-                if drole["is_pure_actuator"]:
-                    links_to_actuator = True
-                if drole["is_thermostat_controller"]:
-                    links_to_thermostat = True
-
-            if links_to_actuator:
-                # Control variable output (thermostat → actuator relay) — skip
-                continue
-            if links_to_thermostat and not links_to_actuator:
-                # On/Off command on a thermostat-capable device
-                if on_off_write is None:
-                    on_off_write = addr
-
-    if temp_state is None:
+    actuator = _select_actuator(gas, com_objects)
+    if not actuator:
         return None
 
-    # If no setpoint write GA was detected, build a read-only thermostat.
-    # Never alias a write address onto the temperature sensor GA.
+    temp_current = None
+    temp_current_rank = len(_TEMP_CURRENT_KEYWORDS) + 1
+    setpoint_write = None
+    setpoint_state = None
+
+    for addr, ga in gas:
+        for direction, sem in _actuator_dpt9_objects(ga, com_objects, actuator):
+            if "setpoint" in sem:
+                if direction == "command" and setpoint_write is None:
+                    setpoint_write = addr
+                elif direction == "feedback" and setpoint_state is None:
+                    setpoint_state = addr
+            elif direction == "feedback":
+                # Current-temperature candidate; rank by keyword so the
+                # effective/control temperature beats the raw probe value.
+                rank = next(
+                    (i for i, kw in enumerate(_TEMP_CURRENT_KEYWORDS) if kw in sem),
+                    len(_TEMP_CURRENT_KEYWORDS),
+                )
+                if rank < temp_current_rank:
+                    temp_current = addr
+                    temp_current_rank = rank
+
+    if temp_current is None:
+        return None
+
     return get_climate_config(
         name=name,
-        temperature_state=temp_state,
+        temperature_state=temp_current,
         setpoint_write=setpoint_write,
-        on_off_write=on_off_write,
+        setpoint_state=setpoint_state,
         controller_mode="heat",
     )
 
@@ -838,52 +708,48 @@ def _build_cover(
     com_objects: dict,
     devices: dict = None,
 ) -> Optional[Dict[str, Any]]:
-    """Build a cover entity using DPT + flags + device roles.
+    """Build a cover entity from actuator-linkage roles per DPT sub-type.
 
-    Identifies the actuator device (the device with the most com objects
-    across all GAs in the function) and uses only its com object flags to
-    distinguish command (write-only) from feedback (transmit-only) GAs.
+    The blind actuator is identified from com-object linkage
+    (:func:`_select_actuator`); GAs are bucketed by DPT sub-type and each
+    bucket's command/feedback pair is resolved by
+    :func:`_pick_command_feedback` from the actuator's own object directions:
 
-    DPT 1.008 = up/down, DPT 1.007 = step/stop, DPT 5.001 = position.
+    - DPT 1.008, command → up/down (long move)
+    - DPT 1.007, command → step/stop
+    - DPT 5.001 → position; command → set, feedback → state
+
+    Other DPT-1 sub-types on the function (1.001 sun-protection enable,
+    drive-status feedback, ...) are deliberately ignored — mapping them onto
+    up/down is exactly the bug this replaces. A function whose actuator exposes
+    no DPT-1.008 command has no usable direction GA and is skipped (the caller
+    reports it).
     """
-    if devices is None:
-        devices = {}
+    actuator = _select_actuator(gas, com_objects)
 
-    actuator_addr = _find_actuator(gas, com_objects)
-
-    up_down_write = None
-    stop_write = None
-    position_set_write = None
-    position_state = None
+    up_down_bucket: List[Tuple[str, bool, bool]] = []
+    stop_bucket: List[Tuple[str, bool, bool]] = []
+    position_bucket: List[Tuple[str, bool, bool]] = []
 
     for addr, ga in gas:
         dpt = ga.get("dpt") or {}
         dpt_main = dpt.get("main")
         dpt_sub = dpt.get("sub")
-
-        actuator_co = _actuator_co_for_ga(ga, com_objects, actuator_addr)
-        if not actuator_co:
+        has_command, has_feedback = _actuator_ga_dirs(ga, com_objects, actuator)
+        if not (has_command or has_feedback):
             continue
-
-        write, transmit = _ga_write_transmit(actuator_co)
-
-        if dpt_main == 1:
-            if dpt_sub == 8:  # up/down
-                if write and not transmit:
-                    up_down_write = addr
-            elif dpt_sub == 7:  # step/stop
-                if write and not transmit:
-                    stop_write = addr
-            elif up_down_write is None and write:
-                up_down_write = addr
+        entry = (addr, has_command, has_feedback)
+        if dpt_main == 1 and dpt_sub == 8:
+            up_down_bucket.append(entry)
+        elif dpt_main == 1 and dpt_sub == 7:
+            stop_bucket.append(entry)
         elif dpt_main == 5:
-            if write and not transmit:
-                position_set_write = addr
-            elif transmit and not write:
-                position_state = addr
-            elif write and position_set_write is None:
-                # write+transmit position object — prefer as the set address
-                position_set_write = addr
+            position_bucket.append(entry)
+
+    # Up/down and stop are command-only roles for HA; ignore any feedback.
+    up_down_write, _ = _pick_command_feedback(up_down_bucket)
+    stop_write, _ = _pick_command_feedback(stop_bucket)
+    position_set_write, position_state = _pick_command_feedback(position_bucket)
 
     if up_down_write is None:
         return None
@@ -1092,6 +958,7 @@ def build_cabinet_promotions(
 def extract_entities(
     project: dict,
     skipped: Optional[List[Dict[str, str]]] = None,
+    include_unmapped: bool = False,
 ) -> List[Dict[str, Any]]:
     """Extract all Home Assistant entities from a parsed KNX project.
 
@@ -1103,6 +970,9 @@ def extract_entities(
         skipped: Optional list populated with functions that could not be
             converted to an entity (each ``{"name", "function_type", "reason"}``),
             so callers can report them instead of dropping them silently.
+        include_unmapped: When True, also run the opt-in deterministic fallback
+            (:func:`_extract_unmapped`) over GAs that belong to no function.
+            Default False — only function-derived entities are returned.
     """
     entities = []
 
@@ -1110,17 +980,21 @@ def extract_entities(
     function_entities = _extract_from_functions(project, skipped=skipped)
     entities.extend(function_entities)
 
-    # Track which GAs were already mapped
-    mapped = set()
-    for ent in function_entities:
-        meta = ent.get("_meta", {})
-        fn_id = meta.get("function_id")
-        if fn_id:
-            fn = project.get("functions", {}).get(fn_id, {})
-            for addr in fn.get("group_addresses", {}):
-                mapped.add(addr)
+    if not include_unmapped:
+        return entities
 
-    # 2. Extract unmapped GAs (binary inputs, etc.)
+    # Track which GAs belong to a function. This must include the GAs of
+    # functions that were *skipped* (not just those successfully built):
+    # ETS grouped those GAs into a function deliberately, so if we could not
+    # build it we must not let the unmapped fallback re-interpret its
+    # individual GAs as loose switches — that yields garbage such as a switch
+    # whose address is actually a status-feedback GA.
+    mapped = set()
+    for fn in project.get("functions", {}).values():
+        for addr in fn.get("group_addresses", {}):
+            mapped.add(addr)
+
+    # 2. Extract unmapped GAs (opt-in deterministic fallback)
     unmapped = _extract_unmapped(project, mapped)
     entities.extend(unmapped)
 
@@ -1647,6 +1521,14 @@ Examples:
         "even those without any mapped KNX functions. "
         "By default only rooms that contain functions are created.",
     )
+    parser.add_argument(
+        "--include-unmapped",
+        action="store_true",
+        help="Also extract entities from group addresses that belong to no ETS "
+        "function, using deterministic actuator linkage (relay channels -> "
+        "switches, pure-source DPT-1 inputs -> binary_sensors). Off by "
+        "default: only entities defined by ETS functions are produced.",
+    )
 
     return parser
 
@@ -1688,7 +1570,9 @@ async def main():
 
     # Extract entities
     skipped: List[Dict[str, str]] = []
-    entities = extract_entities(project, skipped=skipped)
+    entities = extract_entities(
+        project, skipped=skipped, include_unmapped=args.include_unmapped
+    )
 
     # Report functions that could not be converted, so they don't vanish.
     if skipped:
