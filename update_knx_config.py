@@ -10,6 +10,49 @@ import sys
 
 import websockets
 
+
+class KNXIntegrationNotInstalledError(Exception):
+    """Raised when the KNX integration is not loaded in Home Assistant.
+
+    All ``knx/*`` WebSocket commands return ``{"code": "unknown_command"}``
+    when the KNX integration hasn't been added via Settings → Devices &
+    Services.  This exception lets callers distinguish that specific failure
+    from transient WebSocket errors or validation rejections.
+    """
+
+    def __init__(self, message: str = "", ha_url: str = ""):
+        self.ha_url = ha_url
+        hint = (
+            "\n\n  The KNX integration is not installed in Home Assistant.\n"
+            "  Install it via:\n"
+            "    Settings → Devices & Services → Add Integration → search \"KNX\"\n"
+        )
+        if ha_url:
+            hint += f"  Then open: {ha_url}/config/integrations\n"
+        hint += "\n  After installing, re-run this script."
+        super().__init__(message + hint if message else hint.strip())
+
+
+def is_unknown_command(result: dict) -> bool:
+    """Check whether a WebSocket result is an ``unknown_command`` error."""
+    if not isinstance(result, dict) or result.get("success", True):
+        return False
+    err = result.get("error")
+    return isinstance(err, dict) and err.get("code") == "unknown_command"
+
+
+def ws_url_to_http(url: str) -> str:
+    """Convert a HA WebSocket URL to its HTTP base URL for UI links.
+
+    ``ws://host:8123/api/websocket`` → ``http://host:8123``
+    """
+    return (
+        url.replace("/api/websocket", "")
+        .replace("ws://", "http://")
+        .replace("wss://", "https://")
+    )
+
+
 KNX_WEBSOCKET_COMMANDS = {
     "get_base_data": "knx/get_base_data",
     "create_entity": "knx/create_entity",
@@ -85,6 +128,25 @@ async def get_knx_base_data(websocket, msg_id):
     return await send_ws_message(
         websocket, msg_id, KNX_WEBSOCKET_COMMANDS["get_base_data"]
     )
+
+
+async def check_knx_integration(websocket, msg_id, ha_url: str = "") -> None:
+    """Verify that the KNX integration is loaded in Home Assistant.
+
+    Sends a lightweight ``knx/get_base_data`` request.  If HA responds with
+    ``unknown_command``, the KNX integration is not installed and a
+    :class:`KNXIntegrationNotInstalledError` is raised with actionable
+    instructions.
+
+    Raises:
+        KNXIntegrationNotInstalledError: If the KNX integration is missing.
+    """
+    result = await get_knx_base_data(websocket, msg_id)
+    if is_unknown_command(result):
+        raise KNXIntegrationNotInstalledError(
+            "HA returned 'unknown_command' for knx/get_base_data.",
+            ha_url=ha_url,
+        )
 
 
 async def get_entity_schema(websocket, msg_id, platform):

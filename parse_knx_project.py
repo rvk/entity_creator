@@ -35,6 +35,10 @@ from update_knx_config import (
     list_areas,
     create_area,
     update_entity_area,
+    check_knx_integration,
+    is_unknown_command,
+    KNXIntegrationNotInstalledError,
+    ws_url_to_http,
 )
 
 
@@ -1326,6 +1330,14 @@ async def create_entities_batch(
         next_id = itertools.count(1).__next__
 
     try:
+        # Pre-flight: verify the KNX integration is installed.  When using a
+        # shared websocket the caller (main) already checked, but when we
+        # opened our own connection we must check here.
+        if own_ws:
+            await check_knx_integration(
+                websocket, next_id(), ha_url=ws_url_to_http(url)
+            )
+
         # Get the group addresses already bound to existing entities. Matching
         # on group address (not display name) is the reliable dedup signal:
         # the KNX UI assigns entity unique_ids server-side at creation, so they
@@ -1333,6 +1345,14 @@ async def create_entities_batch(
         existing_gas = set()
         if skip_existing:
             grp_result = await get_entities_by_group(websocket, next_id())
+            # Covers the shared-websocket path, where main() ran the
+            # integration pre-flight but this function did not (own_ws is
+            # False, so the check above was skipped).
+            if is_unknown_command(grp_result):
+                raise KNXIntegrationNotInstalledError(
+                    "HA returned 'unknown_command' for knx/get_entities_by_group.",
+                    ha_url=ws_url_to_http(url),
+                )
             existing_gas = set((grp_result.get("result") or {}).keys())
 
         for i, ent in enumerate(filtered):
@@ -1617,23 +1637,51 @@ async def main():
         area_map: Dict[tuple, str] = {}
         create_rooms = not args.skip_rooms
 
-        if create_rooms and locations:
-            hierarchy = extract_location_hierarchy(locations)
-            active_spaces = collect_spaces_with_functions(entities)
+        try:
+            if create_rooms and locations:
+                hierarchy = extract_location_hierarchy(locations)
+                active_spaces = collect_spaces_with_functions(entities)
 
-            # Connect once and reuse for both room + entity creation.
-            print(f"\nConnecting to {args.url}...")
-            websocket = await connect_and_authenticate(args.url, token)
-            next_id = itertools.count(1).__next__
-            try:
-                area_map = await create_floors_and_areas(
-                    hierarchy=hierarchy,
-                    active_spaces=active_spaces,
-                    websocket=websocket,
-                    next_id=next_id,
-                    create_all_rooms=args.create_all_rooms,
-                )
+                # Connect once and reuse for both room + entity creation.
+                print(f"\nConnecting to {args.url}...")
+                websocket = await connect_and_authenticate(args.url, token)
+                next_id = itertools.count(1).__next__
+                try:
+                    # Pre-flight: verify the KNX integration is installed
+                    # before doing any work.  Without it every knx/* command
+                    # silently returns "unknown_command" and the run produces
+                    # hundreds of identical failures that obscure the root
+                    # cause.
+                    await check_knx_integration(
+                        websocket, next_id(), ha_url=ws_url_to_http(args.url)
+                    )
 
+                    area_map = await create_floors_and_areas(
+                        hierarchy=hierarchy,
+                        active_spaces=active_spaces,
+                        websocket=websocket,
+                        next_id=next_id,
+                        create_all_rooms=args.create_all_rooms,
+                    )
+
+                    summary = await create_entities_batch(
+                        entities=entities,
+                        url=args.url,
+                        token=token,
+                        dry_run=False,
+                        skip_existing=args.skip_existing,
+                        filter_platform=args.filter_type,
+                        filter_location=args.filter_location,
+                        area_map=area_map,
+                        websocket=websocket,
+                        next_id=next_id,
+                    )
+                finally:
+                    await websocket.close()
+                    print("Connection closed.")
+            else:
+                if args.skip_rooms and locations:
+                    print("\nRoom/area creation skipped (--skip-rooms).")
                 summary = await create_entities_batch(
                     entities=entities,
                     url=args.url,
@@ -1642,32 +1690,17 @@ async def main():
                     skip_existing=args.skip_existing,
                     filter_platform=args.filter_type,
                     filter_location=args.filter_location,
-                    area_map=area_map,
-                    websocket=websocket,
-                    next_id=next_id,
+                    area_map={},
                 )
-            finally:
-                await websocket.close()
-                print("Connection closed.")
-        else:
-            if args.skip_rooms and locations:
-                print("\nRoom/area creation skipped (--skip-rooms).")
-            summary = await create_entities_batch(
-                entities=entities,
-                url=args.url,
-                token=token,
-                dry_run=False,
-                skip_existing=args.skip_existing,
-                filter_platform=args.filter_type,
-                filter_location=args.filter_location,
-                area_map={},
-            )
 
-        print(
-            f"\nDone: {summary['created']} created, "
-            f"{summary['skipped']} skipped, "
-            f"{summary['failed']} failed"
-        )
+            print(
+                f"\nDone: {summary['created']} created, "
+                f"{summary['skipped']} skipped, "
+                f"{summary['failed']} failed"
+            )
+        except KNXIntegrationNotInstalledError as exc:
+            print(f"\nERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
