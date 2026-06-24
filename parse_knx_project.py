@@ -50,7 +50,9 @@ from update_knx_config import (
 FUNCTION_TYPE_MAP: Dict[str, Dict[str, str]] = {
     "FT-1": {"platform": "light", "usage": "switchable light"},
     "FT-6": {"platform": "light", "usage": "dimmable light"},
+    "FT-7": {"platform": "cover", "usage": "sun protection"},
     "FT-8": {"platform": "climate", "usage": "heating"},
+    "FT-9": {"platform": "climate", "usage": "heating (continuous variable)"},
     "FT-10": {"platform": "switch", "usage": "switchable socket"},
     # FT-0 is custom — need heuristic analysis
 }
@@ -549,9 +551,60 @@ def _build_entity_for_platform(
     elif platform == "binary_sensor":
         return _build_binary_sensor(entity_name, gas)
     elif platform == "cover":
-        return _build_cover(entity_name, gas)
+        return _build_cover(entity_name, gas, com_objects, devices)
 
     return None
+
+
+def _find_actuator(
+    gas: List[Tuple[str, dict]], com_objects: dict
+) -> str:
+    """Return the device address that binds the most com objects.
+
+    Across every GA in a function, the actuator (relay/dimmer/blind drive)
+    typically binds more com objects than the push buttons or sensors that
+    share those GAs, so "most com objects" is a reliable way to single it
+    out. Only its flags are then trusted to tell command from feedback.
+
+    On a tie the winner is whichever device was seen first (dict insertion
+    order); the GA order is deterministic so the result is stable per run,
+    but a genuine tie between two devices is otherwise arbitrary.
+    Returns "" when no com object carries a device address.
+    """
+    device_co_count: Dict[str, int] = {}
+    for _addr, ga in gas:
+        for co_id in ga.get("communication_object_ids", []):
+            co = com_objects.get(co_id, {})
+            dev_addr = co.get("device_address", "")
+            if dev_addr:
+                device_co_count[dev_addr] = device_co_count.get(dev_addr, 0) + 1
+    if not device_co_count:
+        return ""
+    return max(device_co_count, key=device_co_count.get)
+
+
+def _actuator_co_for_ga(
+    ga: dict, com_objects: dict, actuator_addr: str
+) -> Optional[dict]:
+    """Return the actuator's com object bound to this GA, or None.
+
+    When ``actuator_addr`` is empty (no device addresses found) nothing is
+    matched, so the caller skips the GA rather than matching device-less
+    com objects by accident.
+    """
+    if not actuator_addr:
+        return None
+    for co_id in ga.get("communication_object_ids", []):
+        co = com_objects.get(co_id)
+        if co and co.get("device_address", "") == actuator_addr:
+            return co
+    return None
+
+
+def _ga_write_transmit(actuator_co: dict) -> Tuple[bool, bool]:
+    """Return ``(write, transmit)`` flags for an actuator com object."""
+    flags = actuator_co.get("flags", {})
+    return flags.get("write", False), flags.get("transmit", False)
 
 
 def _build_light(
@@ -561,9 +614,17 @@ def _build_light(
     function_type: str,
     devices: dict = None,
 ) -> Optional[Dict[str, Any]]:
-    """Build a light entity from a group of GAs using DPT + flags."""
+    """Build a light entity from a group of GAs using DPT + flags.
+
+    Identifies the actuator device (the device with the most com objects
+    across all GAs in the function) and uses only its com object flags to
+    distinguish command (write-only) from feedback (transmit-only) GAs.
+    This avoids ambiguity from push buttons and sensors that share GAs.
+    """
     if devices is None:
         devices = {}
+
+    actuator_addr = _find_actuator(gas, com_objects)
 
     switch_write = None
     switch_state = None
@@ -571,29 +632,32 @@ def _build_light(
     brightness_state = None
 
     for addr, ga in gas:
-        cls = _classify_ga(ga, com_objects, devices)
-        dpt = cls["dpt_main"]
+        dpt = ga.get("dpt") or {}
+        dpt_main = dpt.get("main")
 
-        if dpt == 1:
-            if cls["has_write"] and not cls["has_transmit"]:
+        actuator_co = _actuator_co_for_ga(ga, com_objects, actuator_addr)
+        if not actuator_co:
+            continue
+
+        write, transmit = _ga_write_transmit(actuator_co)
+
+        if dpt_main == 1:
+            if write and not transmit:
                 switch_write = addr
-            elif cls["has_transmit"] and not cls["has_write"]:
+            elif transmit and not write:
                 switch_state = addr
-            elif cls["has_write"]:
-                switch_write = addr
-            elif cls["has_transmit"]:
-                switch_state = addr
-        elif dpt == 5:
-            if cls["has_write"] and not cls["has_transmit"]:
+            elif write:
+                # write+transmit — prefer as write (command)
+                if not switch_write:
+                    switch_write = addr
+        elif dpt_main == 5:
+            if write and not transmit:
                 brightness_write = addr
-            elif cls["has_transmit"] and not cls["has_write"]:
+            elif transmit and not write:
                 brightness_state = addr
-            elif cls["has_write"]:
-                brightness_write = addr
-            elif cls["has_transmit"]:
-                brightness_state = addr
-        elif dpt == 3:
-            pass
+            elif write:
+                if not brightness_write:
+                    brightness_write = addr
 
     if switch_write is None:
         return None
@@ -613,26 +677,37 @@ def _build_switch(
     com_objects: dict,
     devices: dict = None,
 ) -> Optional[Dict[str, Any]]:
-    """Build a switch entity from a group of GAs using DPT + flags."""
+    """Build a switch entity from a group of GAs using DPT + flags.
+
+    Identifies the actuator device and uses only its com object flags to
+    distinguish command (write-only) from feedback (transmit-only) GAs.
+    """
     if devices is None:
         devices = {}
+
+    actuator_addr = _find_actuator(gas, com_objects)
 
     switch_write = None
     switch_state = None
 
     for addr, ga in gas:
-        cls = _classify_ga(ga, com_objects, devices)
-        if cls["dpt_main"] != 1:
+        dpt = ga.get("dpt") or {}
+        if dpt.get("main") != 1:
             continue
 
-        if cls["has_write"] and not cls["has_transmit"]:
+        actuator_co = _actuator_co_for_ga(ga, com_objects, actuator_addr)
+        if not actuator_co:
+            continue
+
+        write, transmit = _ga_write_transmit(actuator_co)
+
+        if write and not transmit:
             switch_write = addr
-        elif cls["has_transmit"] and not cls["has_write"]:
+        elif transmit and not write:
             switch_state = addr
-        elif cls["has_write"]:
-            switch_write = addr
-        elif cls["has_transmit"]:
-            switch_state = addr
+        elif write:
+            if not switch_write:
+                switch_write = addr
 
     if switch_write is None:
         return None
@@ -672,32 +747,37 @@ def _build_climate(
         dpt = (ga.get("dpt") or {}).get("main")
 
         if dpt == 9:
-            # Aggregate flags across all com objects for this GA
-            has_write_9 = False
-            has_transmit_9 = False
+            # Inspect com objects individually to find write-only (command)
+            # and transmit-only (feedback) flags, avoiding ambiguity when
+            # multiple devices share a GA.
+            write_only_co = None
+            transmit_only_co = None
+            write_transmit_co = None
             for co_id in ga.get("communication_object_ids", []):
                 co = com_objects.get(co_id, {})
                 cc = _classify_com_object(co)
                 if not cc["has_dpt9"]:
                     continue
-                if (
-                    cc["is_write_only"]
-                    or cc["is_write_read"]
-                    or cc["is_write_transmit"]
-                ):
-                    has_write_9 = True
+                if cc["is_write_only"] or cc["is_write_read"]:
+                    write_only_co = co_id
                 if cc["is_transmit_only"]:
-                    has_transmit_9 = True
+                    transmit_only_co = co_id
+                if cc["is_write_transmit"]:
+                    write_transmit_co = co_id
 
-            if has_transmit_9 and not has_write_9:
+            # A write+transmit object still has a write path, so fold it into
+            # the write side; otherwise such setpoints get silently dropped.
+            has_write_co = write_only_co or write_transmit_co
+
+            if transmit_only_co and not has_write_co:
                 # Pure transmit: temperature sensor probe value
                 temp_state = addr
-            elif has_write_9 and not has_transmit_9:
-                # Write-only: thermostat reading from sensor
+            elif has_write_co and not transmit_only_co:
+                # Write path only, no feedback: thermostat reading from sensor
                 if not temp_state:
                     temp_state = addr
-            elif has_write_9:
-                # Write+transmit or write+read: setpoint
+            elif has_write_co:
+                # Both a write path and a transmit-only path exist: setpoint
                 setpoint_write = addr
 
         elif dpt == 1:
@@ -752,39 +832,68 @@ def _build_binary_sensor(
     return get_binary_sensor_config(name=name, state_address=state_address)
 
 
-def _build_cover(name: str, gas: List[Tuple[str, dict]]) -> Optional[Dict[str, Any]]:
-    """Build a cover entity. Uses DPT + address ordering as fallback.
+def _build_cover(
+    name: str,
+    gas: List[Tuple[str, dict]],
+    com_objects: dict,
+    devices: dict = None,
+) -> Optional[Dict[str, Any]]:
+    """Build a cover entity using DPT + flags + device roles.
 
-    Covers typically use DPT 1.008 (up/down) and DPT 1.007 (stop).
-    Without DPT info, falls back to address ordering.
+    Identifies the actuator device (the device with the most com objects
+    across all GAs in the function) and uses only its com object flags to
+    distinguish command (write-only) from feedback (transmit-only) GAs.
+
+    DPT 1.008 = up/down, DPT 1.007 = step/stop, DPT 5.001 = position.
     """
-    up_down = None
+    if devices is None:
+        devices = {}
+
+    actuator_addr = _find_actuator(gas, com_objects)
+
+    up_down_write = None
     stop_write = None
-    position = None
+    position_set_write = None
+    position_state = None
 
     for addr, ga in gas:
-        dpt = ga.get("dpt", {})
-        dpt_main = dpt.get("main") if dpt else None
-        dpt_sub = dpt.get("sub") if dpt else None
+        dpt = ga.get("dpt") or {}
+        dpt_main = dpt.get("main")
+        dpt_sub = dpt.get("sub")
 
-        # DPT 1.008 = up/down, DPT 1.007 = step/stop
-        if dpt_main == 1 and dpt_sub == 8:
-            up_down = addr
-        elif dpt_main == 1 and dpt_sub == 7:
-            stop_write = addr
+        actuator_co = _actuator_co_for_ga(ga, com_objects, actuator_addr)
+        if not actuator_co:
+            continue
+
+        write, transmit = _ga_write_transmit(actuator_co)
+
+        if dpt_main == 1:
+            if dpt_sub == 8:  # up/down
+                if write and not transmit:
+                    up_down_write = addr
+            elif dpt_sub == 7:  # step/stop
+                if write and not transmit:
+                    stop_write = addr
+            elif up_down_write is None and write:
+                up_down_write = addr
         elif dpt_main == 5:
-            position = addr
-        elif up_down is None:
-            up_down = addr  # fallback: first GA
+            if write and not transmit:
+                position_set_write = addr
+            elif transmit and not write:
+                position_state = addr
+            elif write and position_set_write is None:
+                # write+transmit position object — prefer as the set address
+                position_set_write = addr
 
-    if up_down is None:
+    if up_down_write is None:
         return None
 
     return get_cover_config(
         name=name,
-        up_down_write=up_down,
+        up_down_write=up_down_write,
         stop_write=stop_write,
-        position_set_write=position,
+        position_set_write=position_set_write,
+        position_state=position_state,
     )
 
 
@@ -835,8 +944,8 @@ def _platform_from_payload(ent: Dict[str, Any]) -> str:
         if "ga_brightness" in knx or "color" in knx or "ga_color_temp" in knx:
             return "light"
         fn_type = ent.get("_meta", {}).get("function_type", "")
-        if fn_type in ("FT-1", "FT-6"):
-            return "light"
+        if fn_type in FUNCTION_TYPE_MAP:
+            return FUNCTION_TYPE_MAP[fn_type]["platform"]
         return "switch"
     return "?"
 
