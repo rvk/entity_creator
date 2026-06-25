@@ -68,6 +68,7 @@ KNX_WEBSOCKET_COMMANDS = {
     "area_create": "config/area_registry/create",
     "entity_update": "config/entity_registry/update",
     "entity_remove": "config/entity_registry/remove",
+    "entity_list": "config/entity_registry/list",
 }
 
 CLIMATE_CONTROLLER_MODES = (
@@ -241,6 +242,21 @@ async def list_areas(websocket, msg_id):
     list of area objects with ``area_id``, ``name``, ``floor_id``, etc.
     """
     return await send_ws_message(websocket, msg_id, KNX_WEBSOCKET_COMMANDS["area_list"])
+
+
+async def list_knx_entities(websocket, msg_id):
+    """Return all entity-registry entries owned by the KNX integration.
+
+    This Home Assistant version exposes no ``knx`` WebSocket command to list
+    every configured entity in one shot, so the entity registry is the
+    reliable source of truth.  Each returned dict carries ``entity_id``,
+    ``platform`` (``"knx"``), ``config_entry_id``, ``unique_id``, etc.
+    """
+    result = await send_ws_message(
+        websocket, msg_id, KNX_WEBSOCKET_COMMANDS["entity_list"]
+    )
+    entries = result.get("result", []) or []
+    return [e for e in entries if e.get("platform") == "knx"]
 
 
 async def create_area(websocket, msg_id, name, floor_id=None):
@@ -571,10 +587,24 @@ def _build_arg_parser():
         default=60,
         help="Travelling time down in seconds (cover, default: 60).",
     )
-    parser.add_argument(
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument(
         "--delete",
-        help="Delete entity by entity_id (e.g., light.test_light). "
-        "Mutually exclusive with creation flags.",
+        help="Delete entity by entity_id (e.g., light.test_light).",
+    )
+    action_group.add_argument(
+        "--list",
+        action="store_true",
+        help="List all KNX entities and exit. Useful as a preview before "
+        "--delete-all.",
+    )
+    action_group.add_argument(
+        "--delete-all",
+        action="store_true",
+        help="Delete every KNX entity (KNX config store + entity registry). "
+        "Combine with creation flags (--entity-type, --name, ...) to replace "
+        "all entities: existing ones are removed first, then the new entity "
+        "is created. No confirmation prompt.",
     )
     return parser
 
@@ -695,6 +725,71 @@ async def _run_delete(args, token):
         print("Connection closed.")
 
 
+async def _run_list(args, token):
+    print(f"Connecting to {args.url}...")
+    websocket = await connect_and_authenticate(args.url, token)
+    try:
+        msg_id = 1
+        print("\n--- Listing KNX entities ---")
+        entries = await list_knx_entities(websocket, msg_id)
+        msg_id += 1
+        if not entries:
+            print("No KNX entities found.")
+            return
+        print(f"KNX entities: {len(entries)}\n")
+        for entry in entries:
+            entity_id = entry.get("entity_id", "?")
+            name = entry.get("name") or entry.get("original_name") or ""
+            suffix = f"  {name}" if name else ""
+            print(f"  {entity_id}{suffix}")
+    finally:
+        await websocket.close()
+        print("Connection closed.")
+
+
+async def _run_delete_all(args, token):
+    print(f"Connecting to {args.url}...")
+    websocket = await connect_and_authenticate(args.url, token)
+    try:
+        msg_id = 1
+        print("\n--- Listing KNX entities ---")
+        entries = await list_knx_entities(websocket, msg_id)
+        msg_id += 1
+        if not entries:
+            print("No KNX entities found.")
+            return
+        print(f"KNX entities to delete: {len(entries)}\n")
+        removed = 0
+        for entry in entries:
+            entity_id = entry.get("entity_id")
+            if not entity_id:
+                continue
+            # 1. Remove from KNX config store (the deletion that matters).
+            knx_result = await delete_entity(websocket, msg_id, entity_id)
+            msg_id += 1
+            knx_ok = knx_result.get("success", False)
+            # 2. Remove from entity registry (prevents orphaned entries).
+            reg_result = await remove_entity_registry_entry(
+                websocket, msg_id, entity_id
+            )
+            msg_id += 1
+            reg_ok = reg_result.get("success", False)
+            if knx_ok or reg_ok:
+                removed += 1
+                stores = []
+                if knx_ok:
+                    stores.append("knx")
+                if reg_ok:
+                    stores.append("registry")
+                print(f"  removed ({'/'.join(stores)}): {entity_id}")
+            else:
+                print(f"  not found in either store: {entity_id}")
+        print(f"\nRemoved {removed}/{len(entries)} entities.")
+    finally:
+        await websocket.close()
+        print("Connection closed.")
+
+
 async def _run_create(args, token):
     platform, data = _build_payload(args)
 
@@ -746,8 +841,16 @@ async def main():
     args = _build_arg_parser().parse_args()
     token = _resolve_token(args)
 
-    if args.delete:
+    if args.list:
+        await _run_list(args, token)
+    elif args.delete:
         await _run_delete(args, token)
+    elif args.delete_all:
+        await _run_delete_all(args, token)
+        # --delete-all may be combined with creation flags to replace all
+        # entities: delete first, then create the new one.
+        if args.entity_type:
+            await _run_create(args, token)
     else:
         await _run_create(args, token)
 

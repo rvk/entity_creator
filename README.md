@@ -91,6 +91,38 @@ python3 update_knx_config.py \
 python3 update_knx_config.py --delete "light.living_room_light"
 ```
 
+### List all KNX entities
+
+```bash
+python3 update_knx_config.py --list
+```
+
+Lists every entity registered to the KNX integration (entity registry,
+`platform == "knx"`). Useful as a dry-run preview before `--delete-all`.
+
+### Delete all KNX entities
+
+```bash
+python3 update_knx_config.py --delete-all
+```
+
+Removes every KNX entity from both the KNX config store (via
+`knx/delete_entity`) and the entity registry. No confirmation prompt — keep
+backups of your existing installation if you need to roll back.
+
+`--delete`, `--list`, and `--delete-all` are mutually exclusive with each
+other. `--delete-all` may be combined with creation flags to replace all
+entities in one invocation — existing entities are removed first, then the
+new one is created. This is handy when iterating on an ETS project:
+
+```bash
+python3 update_knx_config.py --delete-all \
+  --entity-type switch --name "Garage Switch" --address "1/0/1"
+```
+
+For bulk replacement from a `.knxproj` file, `--delete-all` can be run
+before `parse_knx_project.py --create` to wipe the slate clean first.
+
 ## Project Parser — `parse_knx_project.py`
 
 Parses ETS `.knxproj` project files and bulk-creates all KNX entities found.
@@ -245,6 +277,8 @@ python3 parse_knx_project.py \
 | `--position-state` | Position state address (cover) |
 | `--travelling-time-up` / `--travelling-time-down` | Cover travel time in seconds (default: 60) |
 | `--delete` | Delete entity by entity_id |
+| `--list` | List all KNX entities and exit |
+| `--delete-all` | Delete every KNX entity (config store + registry) |
 
 ## Entity Payload Schemas
 
