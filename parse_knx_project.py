@@ -22,6 +22,8 @@ from xknxproject import XKNXProj
 # Import entity_creator functions
 from update_knx_config import (
     connect_and_authenticate,
+    _run_list,
+    _run_delete_all,
     create_entity,
     get_entities_by_group,
     validate_entity,
@@ -1448,8 +1450,8 @@ Examples:
     # Project file options
     parser.add_argument(
         "--project",
-        required=True,
-        help="Path to the .knxproj project file.",
+        help="Path to the .knxproj project file. Required except for --list "
+        "or a standalone --delete-all.",
     )
     parser.add_argument(
         "--password",
@@ -1530,6 +1532,25 @@ Examples:
         "default: only entities defined by ETS functions are produced.",
     )
 
+    # Entity-management actions (operate on the live HA instance, not the
+    # project file). Mutually exclusive with each other; --delete-all may be
+    # combined with --create to wipe then recreate from the project.
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument(
+        "--list",
+        action="store_true",
+        help="List all KNX entities registered in Home Assistant and exit. "
+        "Needs --token (or HA_TOKEN); --project is not required.",
+    )
+    action_group.add_argument(
+        "--delete-all",
+        action="store_true",
+        help="Delete every KNX entity (KNX config store + entity registry). "
+        "Needs --token (or HA_TOKEN). Combine with --create --project to wipe "
+        "then recreate all entities from the project; used on its own, "
+        "--project is not required.",
+    )
+
     return parser
 
 
@@ -1549,6 +1570,37 @@ def _resolve_password(args) -> str:
 
 async def main():
     args = _build_arg_parser().parse_args()
+
+    # Guard combinations the mutually-exclusive group can't express: --list is
+    # a read-only preview and must not run alongside creation.
+    if args.list and args.create:
+        sys.exit("error: --list cannot be combined with --create.")
+
+    # Entity-management actions act on the live HA instance, not the project
+    # file, so they run before (and may short-circuit) project parsing.
+    if args.list or args.delete_all:
+        token = args.token or os.environ.get("HA_TOKEN")
+        if not token:
+            sys.exit(
+                "error: a token is required for --list/--delete-all. "
+                "Pass --token or set the HA_TOKEN environment variable."
+            )
+        if args.list:
+            await _run_list(args, token)
+            return
+        # --delete-all: wipe every KNX entity first.
+        await _run_delete_all(args, token)
+        if not args.create:
+            return
+        # --delete-all --create: fall through to parse the project and
+        # recreate all entities from it on the now-empty instance.
+
+    if not args.project:
+        sys.exit(
+            "error: --project is required (except with --list or a "
+            "standalone --delete-all)."
+        )
+
     password = _resolve_password(args)
 
     # Parse the KNX project

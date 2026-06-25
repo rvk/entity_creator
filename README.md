@@ -190,6 +190,17 @@ python3 parse_knx_project.py \
   --password "ets-password" \
   --create \
   --skip-rooms
+
+# List every KNX entity in Home Assistant (no project needed) — safe preview
+python3 parse_knx_project.py --token "$HA_TOKEN" --list
+
+# Wipe every KNX entity, then recreate all of them from the project
+python3 parse_knx_project.py \
+  --project project.knxproj \
+  --password "ets-password" \
+  --token "$HA_TOKEN" \
+  --delete-all \
+  --create
 ```
 
 ### How it works
@@ -229,11 +240,11 @@ python3 parse_knx_project.py \
 > `cover`; the batch parser does not. `climate` extraction also requires a
 > detectable setpoint and current-temperature GA in the function.
 
-### CLI Reference
+### CLI Reference — `parse_knx_project.py`
 
 | Argument | Description |
 |---|---|
-| `--project` | Path to `.knxproj` file (required) |
+| `--project` | Path to `.knxproj` file. Required except for `--list` or a standalone `--delete-all` |
 | `--password` | ETS project password. Also settable via `KNX_PROJECT_PASSWORD` env var |
 | `--create` | Actually create entities. Without this flag, performs a dry-run |
 | `--url` | HA WebSocket URL (default: `ws://localhost:8123/api/websocket`) |
@@ -246,8 +257,10 @@ python3 parse_knx_project.py \
 | `--skip-rooms` | Do not create HA areas/floors from project locations, and do not assign entities to areas |
 | `--create-all-rooms` | Create HA areas/floors for ALL rooms found in the project, even those without any mapped functions |
 | `--verbose` / `-v` | Verbose output with entity details |
+| `--list` | List all KNX entities in Home Assistant and exit (no project needed) |
+| `--delete-all` | Delete every KNX entity (config store + registry). Combine with `--create` to wipe then recreate from the project |
 
-## CLI Reference
+## CLI Reference — `update_knx_config.py`
 
 | Argument | Description |
 |---|---|
